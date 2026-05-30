@@ -1,0 +1,5 @@
+# Enable MPU
+CONFIG_ARM_MPU=y
+
+# Enable GPIO
+CONFIG_GPIO=y
