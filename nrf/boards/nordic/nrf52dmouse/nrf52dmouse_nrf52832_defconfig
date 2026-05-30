@@ -1,0 +1,2 @@
+# Enable MPU
+CONFIG_ARM_MPU=y
