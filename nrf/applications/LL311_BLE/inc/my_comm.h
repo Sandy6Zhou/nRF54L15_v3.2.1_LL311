@@ -1,15 +1,3 @@
-/********************************************************************
-**版权所有         深圳市几米物联有限公司
-**文件名称:        my_comm.h
-**文件描述:        LL311_BLE 工程统一头文件
-**当前版本:        V1.0
-**作    者:        Harrison Wu (wuyujiao@jimiiot.com)
-**完成日期:        2026.01.15
-*********************************************************************
-** 功能描述:        集中引用所有模块头文件，便于统一管控
-**                 包含：Main、BLE、Shell、Ctrl、LTE、NFC、GSensor 模块
-*********************************************************************/
-
 #ifndef _MY_COMMON_H_
 #define _MY_COMMON_H_
 
@@ -78,10 +66,6 @@
 #include <bluetooth/services/nus.h>
 #include <soc.h>
 #include <uart_async_adapter.h>
-
-// 包含 FM175XX 相关头文件
-#include "../inc/fm175xx_driver.h"
-#include "../inc/fm175xx_reg.h"
 
 /* ========== 通用宏定义 ========== */
 #define JM_SLEEP(timeout) k_sleep(timeout)
@@ -283,27 +267,6 @@ typedef enum
 } MY_MAIN_TASK_MSG;
 
 /* ========== 集中引用所有模块头文件 ========== */
-#include "my_version.h"
-#include "my_ring_buf.h"
-#include "my_main.h"
-#include "my_ble_core.h"
-#include "my_shell.h"
-#include "my_ctrl.h"
-#include "my_lte.h"
-#include "my_nfc.h"
 #include "my_gsensor.h"
-#include "my_gsensor_algorithm.h"
-#include "my_motor.h"
-#include "my_battery.h"
-// #include "my_wdt.h"
-#include "my_tool.h"
-#include "my_ble_app.h"
-#include "my_cmd_setting.h"
-#include "my_dfu_jimi.h"
-#include "my_ble_log.h"
-#include "my_pm.h"
-#include "my_ble_scan.h"
-#include "my_flash_store.h"
-#include "my_zms_param.h"
 
 #endif /* _MY_COMMON_H_ */

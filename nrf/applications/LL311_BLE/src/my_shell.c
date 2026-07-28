@@ -1,23 +1,11 @@
-/********************************************************************
-**版权所有         深圳市几米物联有限公司
-**文件名称:        my_shell.c
-**文件描述:        Shell 命令行交互模块实现（基于 RTT）
-**当前版本:        V1.0
-**作    者:        Harrison Wu (wuyujiao@jimiiot.com)
-**完成日期:        2026.01.22
-*********************************************************************
-** 功能描述:        注册自定义 Shell 命令，用于系统诊断和设备控制
-*********************************************************************/
-
-/* 必须在包含 my_comm.h 之前定义 BLE_LOG_MODULE_ID，避免与 my_ble_log.h 中的默认定义冲突 */
-#define BLE_LOG_MODULE_ID BLE_LOG_MOD_SHELL
-
 #include "my_comm.h"
+#include "imu_api.h"
+
+/* QMI8658B Shell测试开关：置1开启测试命令，量产前恢复为0 */
+#define QMI8658B_SHELL_TEST_ENABLE    1
 
 #define LOG_MODULE_NAME my_shell
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
-
-uint8_t g_shell_test_buff[256] = {0};
 
 /********************************************************************
 **函数名称:  cmd_system_info
@@ -89,98 +77,6 @@ static int cmd_reboot(const struct shell *shell, size_t argc, char **argv)
 }
 
 /********************************************************************
-**函数名称:  cmd_switch_mode
-**入口参数:  sh      ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
-**出口参数:  无
-**函数功能:  切换工作模式（longlife/smart/continuous）
-**返 回 值:  0 表示成功，负数表示失败
-*********************************************************************/
-static int cmd_switch_mode(const struct shell *sh, size_t argc, char **argv)
-{
-    gsensor_state_t gsensor_state;
-    work_mode_t current_workmode;
-    const char *mode_str;
-    const char *state_str;
-
-    if (argc < 2)
-    {
-        shell_error(sh, "Missing <mode> argument");
-        shell_print(sh, "Usage: app switchmode <mode> <state>");
-        shell_print(sh, "  mode  : longlife | smart | continuous");
-        shell_print(sh, "  state : still | land | sea (only for smart mode)");
-        return -EINVAL;
-    }
-
-    mode_str = argv[1];
-    state_str = (argc >= 3) ? argv[2] : NULL;
-
-    /* 解析工作模式 */
-    if (strcmp(mode_str, "longlife") == 0)
-    {
-        current_workmode = MY_MODE_LONG_LIFE;
-        gsensor_state = STATE_UNKNOWN;
-    }
-    else if (strcmp(mode_str, "smart") == 0)
-    {
-        current_workmode = MY_MODE_SMART;
-
-        /* 智能模式下需要 state 参数 */
-        if (state_str == NULL)
-        {
-            shell_error(sh, "Smart mode requires <state> argument");
-            shell_print(sh, "Valid states: still | land | sea");
-            return -EINVAL;
-        }
-
-        if (strcmp(state_str, "static") == 0)
-        {
-            gsensor_state = STATE_STATIC;
-        }
-        else if (strcmp(state_str, "land") == 0)
-        {
-            gsensor_state = STATE_LAND_TRANSPORT;
-        }
-        else if (strcmp(state_str, "sea") == 0)
-        {
-            gsensor_state = STATE_SEA_TRANSPORT;
-        }
-        else
-        {
-            shell_error(sh, "Invalid state '%s' for smart mode", state_str);
-            shell_print(sh, "Valid states: still | land | sea");
-            return -EINVAL;
-        }
-    }
-    else if (strcmp(mode_str, "continuous") == 0)
-    {
-        current_workmode = MY_MODE_CONTINUOUS;
-        gsensor_state = STATE_UNKNOWN;
-    }
-    else
-    {
-        shell_error(sh, "Invalid mode '%s'", mode_str);
-        shell_print(sh, "Valid modes: longlife | smart | continuous");
-        return -EINVAL;
-    }
-
-    g_gsensor_runtime_ctx.current_gsensor_state = gsensor_state;
-
-    /* 调用实际的业务函数去切换模式/状态 */
-    switch_work_mode(current_workmode);
-
-    shell_print(sh, "Switch mode OK:");
-    shell_print(sh, "  mode  = %s", mode_str);
-    if (current_workmode == MY_MODE_SMART)
-    {
-        shell_print(sh, "  state = %s", state_str);
-    }
-
-    return 0;
-}
-
-/********************************************************************
 **函数名称:  cmd_set_time
 **入口参数:  sh      ---        Shell 实例指针
 **           argc    ---        参数数量
@@ -207,7 +103,7 @@ static int cmd_set_time(const struct shell *sh, size_t argc, char **argv)
         shell_error(sh, "Invalid number: %s", argv[1]);
         return -EINVAL;
     }
-
+    extern int my_set_system_time(time_t _sec);
     ret = my_set_system_time((time_t)epoch);
     if (ret < 0)
     {
@@ -215,1417 +111,923 @@ static int cmd_set_time(const struct shell *sh, size_t argc, char **argv)
         return ret;
     }
 
-    if (gConfigParam.device_workmode_config.workmode_config.current_mode == MY_MODE_LONG_LIFE)
-    {
-        my_send_msg(MOD_MAIN, MOD_MAIN, MY_MSG_RESET_LTE_TIMER);
-    }
-
     shell_print(sh, "System time set to epoch: %llu", epoch);
     return 0;
 }
 
+#if QMI8658B_SHELL_TEST_ENABLE
+#define QMI8658B_TEST_FIFO_MAX_FRAMES     16U
+#define QMI8658B_TEST_SENSOR_ACC           0x01U
+#define QMI8658B_TEST_SENSOR_GYR           0x02U
+#define QMI8658B_TEST_REG_CTRL1            0x02U
+#define QMI8658B_TEST_REG_CTRL2            0x03U
+#define QMI8658B_TEST_REG_CTRL3            0x04U
+#define QMI8658B_TEST_REG_CTRL7            0x08U
+#define QMI8658B_TEST_REG_CAL1_L           0x0BU
+#define QMI8658B_TEST_REG_FIFO_COUNT       0x15U
+#define QMI8658B_TEST_CTRL1_FIFO_INT1      0x04U
+#define QMI8658B_TEST_FIFO_STATUS_NOT_EMPTY 0x10U
+#define QMI8658B_TEST_FIFO_STATUS_WTM      0x40U
+
+static imu_raw_data_t s_qmi8658b_fifo_frames[QMI8658B_TEST_FIFO_MAX_FRAMES];
+static volatile uint32_t s_qmi8658b_int_count;
+static uint8_t s_qmi8658b_gyro_gain[6];
+static bool s_qmi8658b_gyro_gain_valid;
+
 /********************************************************************
-**函数名称:  cmd_get_time
-**入口参数:  sh      ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
+**函数名称:  qmi8658b_shell_int_callback
+**入口参数:  无
 **出口参数:  无
-**函数功能:  获取当前系统时间（Unix 时间戳）
-**返 回 值:  0 表示成功
+**函数功能:  记录QMI8658B INT1 GPIO中断次数
+**返回值:    无
+**注意事项:  运行于GPIO中断上下文，仅执行计数操作
 *********************************************************************/
-static int cmd_get_time(const struct shell *sh, size_t argc, char **argv)
+static void qmi8658b_shell_int_callback(void)
 {
-    time_t second = my_get_system_time_sec();
-    shell_print(sh, "System time set to epoch: %llu", second);
-    return 0;
+    s_qmi8658b_int_count++;
 }
 
 /********************************************************************
-**函数名称:  cmd_modeset
-**入口参数:  sh      ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
+**函数名称:  qmi8658b_shell_print_result
+**入口参数:  shell     ---        Shell实例指针（输入）
+**           operation ---        操作名称（输入）
+**           result    ---        IMU接口返回值（输入）
 **出口参数:  无
-**函数功能:  配置长续航或智能模式的各项参数
-**返 回 值:  0 表示成功，-1 表示失败
+**函数功能:  统一输出QMI8658B测试操作结果
+**返回值:    无
 *********************************************************************/
-static int cmd_modeset(const struct shell *sh, size_t argc, char **argv)
+static void qmi8658b_shell_print_result(const struct shell *shell, const char *operation, imu_result_t result)
 {
-    device_work_mode_config_t *p_workmode;
-    char *endptr;
-    uint32_t mode_flag;
-    uint32_t report_interval, static_int, land_int, land_distance, sea_int;
-    uint8_t sleep_sw;
-
-    p_workmode = &gConfigParam.device_workmode_config.workmode_config;
-
-    /* 第一步：解析模式标识（mode_flag），校验是否为有效数字 */
-    mode_flag = strtoul(argv[1], &endptr, 10);
-    if (*endptr != '\0')
+    if (result == IMU_SUCCESS)
     {
-        shell_print(sh, "Error: mode_flag must be a number (1 or 2)!");
-        return -1;
-    }
-
-    /* 第二步：根据模式标识校验参数个数，并处理对应逻辑 */
-    switch (mode_flag)
-    {
-        case 1: // 长续航模式
-        {
-            // 校验参数个数（app modeset 1 10 0001 → argc=4）
-            if (argc != 4)
-            {
-                shell_print(sh, "Invalid argument count for mode 1!");
-                shell_print(sh, "Usage: app modeset 1 <report_interval> <start_time>");
-                shell_print(sh, "  report_interval: 5-1440 minutes (range limit)");
-                shell_print(sh, "  start_time    : HHMM (24h format, 0000-2359)");
-                return -1;
-            }
-
-            // 解析并校验上报间隔（5-1440分钟）
-            report_interval = strtoul(argv[2], &endptr, 10);
-            if (*endptr != '\0' || report_interval < 5 || report_interval > 1440)
-            {
-                shell_print(sh, "Error: report_interval must be 5-1440 minutes!");
-                return -1;
-            }
-
-            // 校验启动时间格式（HHMM，4位数字）
-            if (strlen(argv[3]) != 4)
-            {
-                shell_print(sh, "Error: start_time must be 4 digits (HHMM)!");
-                return -1;
-            }
-            for (int i = 0; i < 4; i++)
-            {
-                if (!isdigit(argv[3][i]))
-                {
-                    shell_print(sh, "Error: start_time must be numeric (0000-2359)!");
-                    return -1;
-                }
-            }
-
-            // 设置长续航模式参数
-            set_long_battery_params(p_workmode, report_interval, argv[3]);
-            shell_print(sh, "Longlife mode config success!");
-
-            break;
-        }
-        case 2: // 智能模式
-        {
-            // 校验参数个数（app modeset 2 s l ld se sw → argc=7）
-            if (argc != 7)
-            {
-                shell_print(sh, "Invalid argument count for mode 2!");
-                shell_print(sh, "Usage: app modeset 2 <static_int> <land_int> <land_distance> <sea_int> <sleep_sw>");
-                shell_print(sh, "  static_int    : Static state threshold (integer)");
-                shell_print(sh, "  land_int      : Land transport threshold (integer)");
-                shell_print(sh, "  land_distance : Land distance threshold (integer)");
-                shell_print(sh, "  sea_int       : Sea transport threshold (integer)");
-                shell_print(sh, "  sleep_sw      : Sleep switch (0/1/2)");
-                return -1;
-            }
-
-            // 解析并校验static_int（正整数）
-            static_int = strtoul(argv[2], &endptr, 10);
-            if (*endptr != '\0')
-            {
-                shell_print(sh, "Error: static_int must be an integer!");
-                return -1;
-            }
-
-            // 解析并校验land_int（正整数）
-            land_int = strtoul(argv[3], &endptr, 10);
-            if (*endptr != '\0')
-            {
-                shell_print(sh, "Error: land_int must be an integer!");
-                return -1;
-            }
-
-            // 解析并校验land_distance（正整数）
-            land_distance = strtoul(argv[4], &endptr, 10);
-            if (*endptr != '\0')
-            {
-                shell_print(sh, "Error: land_distance must be an integer!");
-                return -1;
-            }
-
-            // 解析并校验sea_int（正整数）
-            sea_int = strtoul(argv[5], &endptr, 10);
-            if (*endptr != '\0')
-            {
-                shell_print(sh, "Error: sea_int must be an integer!");
-                return -1;
-            }
-
-            // 解析并校验sleep_sw（仅支持0或1或2）
-            sleep_sw = (uint8_t)strtoul(argv[6], &endptr, 10);
-            if (*endptr != '\0' || (sleep_sw != 0 && sleep_sw != 1 && sleep_sw != 2))
-            {
-                shell_print(sh, "Error: sleep_sw must be 0 or 1 or 2!");
-                return -1;
-            }
-
-            // 设置智能模式参数
-            set_intelligent_params(p_workmode, static_int, land_int, land_distance, sea_int, sleep_sw);
-            shell_print(sh, "Sensor mode config success!");
-            break;
-        }
-        default: // 不支持的模式标识
-            shell_print(sh, "Error: Unsupported mode_flag! Only 1 (longlife) or 2 (smart) are supported!");
-            return -1;
-    }
-
-    return 0;
-}
-
-/********************************************************************
-**函数名称:  my_shell_handle_rx
-**入口参数:  pData    ---        接收到的数据缓冲区
-**           iLen     ---        数据长度
-**出口参数:  无
-**函数功能:  处理接收到的字符串，解析并执行命令
-**返 回 值:  无
-*********************************************************************/
-static void my_shell_handle_rx(uint8_t *pData, uint32_t iLen)
-{
-    static char command[MAX_CMD_LEN] = {0};
-    static uint32_t index = 0;
-    uint32_t i;
-
-    for (i = 0; i < iLen; i++)
-    {
-        if (pData[i] == '\r' || pData[i] == '\n') // 回车是\r 为了兼容同时处理 \n
-        {
-            my_lte_parse_cmd(command, index);
-
-            command[0] = 0;
-            index = 0;
-
-            // 如果下个字符是\n，跳过
-            if (pData[i + 1] == '\n')
-            {
-                i++;
-            }
-        }
-        else if (index < (MAX_CMD_LEN - 1))
-        {
-            command[index++] = pData[i];
-            command[index] = '\0';
-        }
-    }
-}
-
-/********************************************************************
-**函数名称:  shell_at_test
-**入口参数:  sh       ---        shell结构体指针
-**           argc     ---        参数个数
-**           argv     ---        参数数组
-**出口参数:  无
-**函数功能:  AT测试命令处理函数
-**返 回 值:  0表示成功，-EINVAL表示参数错误
-*********************************************************************/
-static int shell_at_test(const struct shell *sh, size_t argc, char **argv)
-{
-    int len;
-
-    if (argc < 2)
-    {
-        shell_error(sh, "Missing parameter");
-        return -EINVAL;
-    }
-
-    memset(g_shell_test_buff, 0, sizeof(g_shell_test_buff));
-
-    len = strlen(argv[1]);
-    memcpy(g_shell_test_buff, argv[1], len);
-    // 手动增加\r\n，使得my_shell_handle_rx能识别到
-    g_shell_test_buff[len++] = '\r';
-    g_shell_test_buff[len++] = '\n';
-    g_shell_test_buff[len] = 0;
-
-    shell_print(sh, "param: %s, len: %d", argv[1], len);
-
-    my_shell_handle_rx(g_shell_test_buff, len);
-
-    return 0;
-}
-
-/********************************************************************
-**函数名称:  cmd_nfc_poll
-**入口参数:  shell   ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
-**出口参数:  无
-**函数功能:  启动或停止 NFC 轮询（读到卡或超时后自动进入 HPD）
-**返 回 值:  0 表示成功
-*********************************************************************/
-static int cmd_nfc_poll(const struct shell *shell, size_t argc, char **argv)
-{
-    if (argc < 2)
-    {
-        shell_print(shell, "Usage: app nfc_poll <start|stop> [timeout_sec]");
-        shell_print(shell, "  start [timeout_sec] - Start NFC polling (default 30s, auto HPD after card detected or timeout)");
-        shell_print(shell, "  stop                - Stop NFC polling and enter HPD mode");
-        return -EINVAL;
-    }
-
-    if (strcmp(argv[1], "start") == 0)
-    {
-        uint32_t timeout_s = 30; /* 默认30秒 */
-        if (argc >= 3)
-        {
-            timeout_s = atoi(argv[2]);
-            if (timeout_s == 0)
-            {
-                timeout_s = 30; /* 如果输入无效，使用默认值 */
-            }
-        }
-        shell_print(shell, "Starting NFC polling for %d seconds...", timeout_s);
-        my_nfc_start_poll(timeout_s);
-        shell_print(shell, "NFC polling started: %ds timeout, will enter HPD mode when card detected or timeout", timeout_s);
-    }
-    else if (strcmp(argv[1], "stop") == 0)
-    {
-        shell_print(shell, "Stopping NFC polling...");
-        my_nfc_stop_poll();
-        shell_print(shell, "NFC polling stopped, entered HPD mode");
+        shell_print(shell, "QMI8658B %s: PASS", operation);
     }
     else
     {
-        shell_error(shell, "Invalid parameter: %s", argv[1]);
-        shell_print(shell, "Usage: app nfc_poll <start|stop> [timeout_sec]");
+        shell_error(shell, "QMI8658B %s: FAIL, ret=%d", operation, result);
+    }
+}
+
+/********************************************************************
+**函数名称:  qmi8658b_shell_get_fifo_words
+**入口参数:  无
+**出口参数:  fifo_words ---      FIFO 当前字计数（输出）
+**函数功能:  读取并解析 FIFO_COUNT 的 10 位字计数
+**返回值:    IMU_SUCCESS 表示成功，其他表示错误码
+*********************************************************************/
+static imu_result_t qmi8658b_shell_get_fifo_words(uint16_t *fifo_words)
+{
+    uint8_t count[2];
+    imu_result_t result;
+
+    if (fifo_words == NULL)
+    {
+        return IMU_ERROR_PARAM;
+    }
+
+    result = imu_read_reg(QMI8658B_TEST_REG_FIFO_COUNT, count, sizeof(count));
+    if (result == IMU_SUCCESS)
+    {
+        *fifo_words = (uint16_t)((uint16_t)count[0] | (((uint16_t)count[1] & 0x03U) << 8));
+    }
+
+    return result;
+}
+
+/********************************************************************
+**函数名称:  qmi8658b_shell_parse_feature
+**入口参数:  name    ---        特性名称字符串（输入）
+**出口参数:  feature ---        解析后的特性类型
+**函数功能:  解析Shell输入的嵌入式特性名称
+**返回值:    0表示成功，-EINVAL表示参数无效
+*********************************************************************/
+static int qmi8658b_shell_parse_feature(const char *name, imu_feature_t *feature)
+{
+    if ((name == NULL) || (feature == NULL))
+    {
         return -EINVAL;
     }
 
-    return 0;
-}
-
-/********************************************************************
-**函数名称：cmd_shutdown
-**入口参数：shell   ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
-**出口参数：无
-**函数功能：执行系统关机（进入超低功耗模式，仅按键可唤醒）
-**返 回 值：0 表示成功
-*********************************************************************/
-static int cmd_shutdown(const struct shell *shell, size_t argc, char **argv)
-{
-    msg_t msg;
-
-    ARG_UNUSED(argc);
-    ARG_UNUSED(argv);
-
-    shell_print(shell, "System shutdown request...");
-    shell_print(shell, "Entering SHUTDOWN mode (ultra-low power, only KEY can wakeup)");
-
-    /* 发送关机请求到主任务 */
-    msg.msgID = MY_MSG_CTRL_SHUTDOWN_REQUEST;
-    msg.pData = NULL;
-    msg.DataLen = 0;
-    my_send_msg_data(MOD_MAIN, MOD_MAIN, &msg);
-
-    return 0;
-}
-
-/********************************************************************
-**函数名称:  cmd_ble_log_test
-**入口参数:  shell    ---        Shell 句柄
-**           argc     ---        参数个数
-**           argv     ---        参数数组
-**出口参数:  无
-**函数功能:  测试蓝牙日志发送功能
-**返 回 值:  0 表示成功
-**使用示例:  app blog "test message"
-*********************************************************************/
-static int cmd_ble_log_test(const struct shell *shell, size_t argc, char **argv)
-{
-    const char *msg;
-    size_t len;
-    uint8_t send_len;
-
-    if (argc < 2)
+    if (strcmp(name, "any") == 0)
     {
-        shell_print(shell, "Usage: app blog \"<message>\"");
-        shell_print(shell, "Example: app blog \"Hello BLE Log\"");
-        shell_print(shell, "Note: Message must be enclosed in quotes");
-        return -1;
+        *feature = IMU_FEATURE_ANY_MOTION;
     }
-
-    msg = argv[1];
-    len = strlen(msg);
-
-    /* 检查参数是否包含空格（带引号的参数在argc=2时是一个整体）
-     * 如果argc>2，说明参数被空格分割，用户可能忘记加引号 */
-    if (argc > 2)
+    else if (strcmp(name, "no") == 0)
     {
-        shell_print(shell, "Error: Message must be enclosed in quotes");
-        shell_print(shell, "Usage: app blog \"<message>\"");
-        return -1;
+        *feature = IMU_FEATURE_NO_MOTION;
     }
-
-    /* 检查长度限制 */
-    if (len == 0)
+    else if (strcmp(name, "sig") == 0)
     {
-        shell_print(shell, "Message is empty");
-        return -1;
+        *feature = IMU_FEATURE_SIG_MOTION;
     }
-
-    if (len > 512)
+    else if (strcmp(name, "tap") == 0)
     {
-        shell_print(shell, "Message too long (max 512 bytes)");
-        return -1;
-    }
-
-    /* 限制发送长度为 255 字节（ble_log_send 参数类型为 uint8_t） */
-    send_len = (len > 255) ? 255 : (uint8_t)len;
-
-    shell_print(shell, "Sending BLE log: %s", msg);
-    ble_log_send((uint8_t *)msg, send_len);
-    shell_print(shell, "BLE log sent, length: %d", send_len);
-
-    return 0;
-}
-
-/********************************************************************
-**函数名称:  cmd_ble_log_config
-**入口参数:  shell    ---        Shell 句柄
-**           argc     ---        参数个数
-**           argv     ---        参数数组
-**出口参数:  无
-**函数功能:  蓝牙日志配置命令
-**返 回 值:  0 表示成功
-**使用示例:  app blogcfg global 1          (开启总开关)
-**           app blogcfg mod BLE 1         (开启BLE模块)
-**           app blogcfg level BLE 3       (BLE模块INF等级)
-**           app blogcfg show              (显示配置)
-*********************************************************************/
-static int cmd_ble_log_config(const struct shell *shell, size_t argc, char **argv)
-{
-    ble_log_config_t *config;
-    int ret;
-    uint8_t level;
-    uint8_t mod_id;
-    uint8_t en;
-
-    if (argc < 2)
-    {
-        shell_print(shell, "Usage:");
-        shell_print(shell, "  app blogcfg global <0|1>        - Set global enable");
-        shell_print(shell, "  app blogcfg mod <name> <0|1>    - Set module enable");
-        shell_print(shell, "  app blogcfg level <name> <0-4>  - Set module level");
-        shell_print(shell, "  app blogcfg show                - Show configuration");
-        shell_print(shell, "Module names:");
-        shell_print(shell, "  MAIN, BLE, DFU, SENSOR, LTE, CTRL, SHELL, NFC,");
-        shell_print(shell, "  BATTERY, MOTOR, CMD, TOOL, PARAM, WDT, OTHER");
-        shell_print(shell, "Level: 0=NONE, 1=ERR, 2=WRN, 3=INF, 4=DBG");
-        return -1;
-    }
-
-    config = my_param_get_ble_log_config();
-
-    if (strcmp(argv[1], "global") == 0)
-    {
-        if (argc < 3)
-        {
-            shell_print(shell, "Current global enable: %d", config->global_en);
-            return 0;
-        }
-
-        en = atoi(argv[2]) ? 1 : 0; // 支持非0为1，否则为0
-
-        ret = my_param_set_ble_log_global(en);  // 保存全局使能参数
-        if (ret == 0)
-        {
-            shell_print(shell, "BLE log global enable set to: %d", en);
-        }
-        else
-        {
-            shell_print(shell, "Failed to set global enable");
-        }
-    }
-    else if (strcmp(argv[1], "mod") == 0)
-    {
-        if (argc < 4)
-        {
-            shell_print(shell, "Usage: app blogcfg mod <name> <0|1>");
-            return -1;
-        }
-
-        en = atoi(argv[3]) ? 1 : 0; // 支持非0为1，否则为0
-
-        if (strcmp(argv[2], "MAIN") == 0)
-            mod_id = BLE_LOG_MOD_MAIN;
-        else if (strcmp(argv[2], "BLE") == 0) // BLE 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "BLE module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "DFU") == 0) // DFU 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "DFU module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "SENSOR") == 0)
-            mod_id = BLE_LOG_MOD_SENSOR;
-        else if (strcmp(argv[2], "LTE") == 0)
-            mod_id = BLE_LOG_MOD_LTE;
-        else if (strcmp(argv[2], "CTRL") == 0)
-            mod_id = BLE_LOG_MOD_CTRL;
-        else if (strcmp(argv[2], "SHELL") == 0) // SHELL 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "SHELL module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "NFC") == 0)
-            mod_id = BLE_LOG_MOD_NFC;
-        else if (strcmp(argv[2], "BATTERY") == 0)
-            mod_id = BLE_LOG_MOD_BATTERY;
-        else if (strcmp(argv[2], "MOTOR") == 0)
-            mod_id = BLE_LOG_MOD_MOTOR;
-        else if (strcmp(argv[2], "CMD") == 0) // CMD 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "CMD module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "TOOL") == 0)
-            mod_id = BLE_LOG_MOD_TOOL;
-        else if (strcmp(argv[2], "PARAM") == 0)
-            mod_id = BLE_LOG_MOD_PARAM;
-        else if (strcmp(argv[2], "WDT") == 0)
-            mod_id = BLE_LOG_MOD_WDT;
-        else if (strcmp(argv[2], "OTHER") == 0)
-            mod_id = BLE_LOG_MOD_OTHER;
-        else
-        {
-            shell_print(shell, "Unknown module: %s", argv[2]);
-            return -1;
-        }
-
-        ret = my_param_set_ble_log_mod(mod_id, en);
-        if (ret == 0)
-        {
-            shell_print(shell, "BLE log module %s enable set to: %d", argv[2], en);
-        }
-        else
-        {
-            shell_print(shell, "Failed to set module enable");
-        }
-    }
-    else if (strcmp(argv[1], "level") == 0)
-    {
-        if (argc < 4)
-        {
-            shell_print(shell, "Usage: app blogcfg level <name> <0-4>");
-            return -1;
-        }
-
-        level = atoi(argv[3]);
-
-        if (strcmp(argv[2], "MAIN") == 0)
-            mod_id = BLE_LOG_MOD_MAIN;
-        else if (strcmp(argv[2], "BLE") == 0) // BLE 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "BLE module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "DFU") == 0) // DFU 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "DFU module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "SENSOR") == 0)
-            mod_id = BLE_LOG_MOD_SENSOR;
-        else if (strcmp(argv[2], "LTE") == 0)
-            mod_id = BLE_LOG_MOD_LTE;
-        else if (strcmp(argv[2], "CTRL") == 0)
-            mod_id = BLE_LOG_MOD_CTRL;
-        else if (strcmp(argv[2], "SHELL") == 0) // SHELL 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "SHELL module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "NFC") == 0)
-            mod_id = BLE_LOG_MOD_NFC;
-        else if (strcmp(argv[2], "BATTERY") == 0)
-            mod_id = BLE_LOG_MOD_BATTERY;
-        else if (strcmp(argv[2], "MOTOR") == 0)
-            mod_id = BLE_LOG_MOD_MOTOR;
-        else if (strcmp(argv[2], "CMD") == 0) // CMD 模块不支持 BLE 日志（递归风险），初始化时已禁用
-        {
-            shell_print(shell, "CMD module does not support BLE log (recursive risk)");
-            return -1;
-        }
-        else if (strcmp(argv[2], "TOOL") == 0)
-            mod_id = BLE_LOG_MOD_TOOL;
-        else if (strcmp(argv[2], "PARAM") == 0)
-            mod_id = BLE_LOG_MOD_PARAM;
-        else if (strcmp(argv[2], "WDT") == 0)
-            mod_id = BLE_LOG_MOD_WDT;
-        else if (strcmp(argv[2], "OTHER") == 0)
-            mod_id = BLE_LOG_MOD_OTHER;
-        else
-        {
-            shell_print(shell, "Unknown module: %s", argv[2]);
-            return -1;
-        }
-
-        ret = my_param_set_ble_log_level(mod_id, level);
-        if (ret == 0)
-        {
-            shell_print(shell, "BLE log module %s level set to: %d", argv[2], level);
-        }
-        else
-        {
-            shell_print(shell, "Failed to set module level");
-        }
-    }
-    else if (strcmp(argv[1], "show") == 0)
-    {
-        shell_print(shell, "BLE Log Configuration:");
-        shell_print(shell, "  Global enable: %d", config->global_en);
-        shell_print(shell, "  Module status (ON/OFF + level(0:NONE 1:ERR 2:WRN 3:INF 4:DBG)):");
-        shell_print(shell, "    MAIN:   %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_MAIN) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_MAIN]);
-        shell_print(shell, "    BLE:    %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_BLE) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_BLE]);
-        shell_print(shell, "    DFU:    %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_DFU) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_DFU]);
-        shell_print(shell, "    SENSOR: %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_SENSOR) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_SENSOR]);
-        shell_print(shell, "    LTE:    %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_LTE) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_LTE]);
-        shell_print(shell, "    CTRL:   %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_CTRL) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_CTRL]);
-        shell_print(shell, "    SHELL:  %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_SHELL) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_SHELL]);
-        shell_print(shell, "    NFC:    %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_NFC) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_NFC]);
-        shell_print(shell, "    BATTERY: %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_BATTERY) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_BATTERY]);
-        shell_print(shell, "    MOTOR:  %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_MOTOR) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_MOTOR]);
-        shell_print(shell, "    CMD:    %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_CMD) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_CMD]);
-        shell_print(shell, "    TOOL:   %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_TOOL) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_TOOL]);
-        shell_print(shell, "    PARAM:  %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_PARAM) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_PARAM]);
-        shell_print(shell, "    WDT:    %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_WDT) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_WDT]);
-        shell_print(shell, "    OTHER:  %s  %d",
-                    BLE_LOG_MOD_IS_ENABLED(config, BLE_LOG_MOD_OTHER) ? "ON" : "OFF",
-                    config->mod_level[BLE_LOG_MOD_OTHER]);
+        *feature = IMU_FEATURE_TAP;
     }
     else
     {
-        shell_print(shell, "Unknown command: %s", argv[1]);
-        return -1;
+        return -EINVAL;
     }
 
     return 0;
 }
 
 /********************************************************************
-**函数名称:  cmd_ble_test
-**入口参数:  sh    ---        Shell句柄，用于输出信息
-            argc  ---        参数个数
-            argv  ---        参数数组，argv[1]为测试参数字符串
-**出口参数:  无
-**函数功能:  处理BLE测试命令，接收参数并发送测试消息到BLE模块
-**返 回 值:  0表示成功，-EINVAL表示参数错误
+**函数名称:  qmi8658b_shell_parse_int_source
+**入口参数:  name   ---        中断源名称字符串（输入）
+**出口参数:  source ---        解析后的中断源
+**函数功能:  解析Shell输入的QMI8658B中断源名称
+**返回值:    0表示成功，-EINVAL表示参数无效
 *********************************************************************/
-static int cmd_ble_test(const struct shell *sh, size_t argc, char **argv)
+static int qmi8658b_shell_parse_int_source(const char *name, imu_int_src_t *source)
 {
-    int len;
-
-    if (argc < 2)
+    if ((name == NULL) || (source == NULL))
     {
-        shell_error(sh, "Missing parameter");
         return -EINVAL;
     }
 
-    memset(g_shell_test_buff, 0, sizeof(g_shell_test_buff));
-
-    len = strlen(argv[1]);
-    memcpy(g_shell_test_buff, argv[1], len);
-    g_shell_test_buff[len] = 0;
-
-    shell_print(sh, "param: %s, len: %d", argv[1], len);
-
-    my_send_msg(MOD_MAIN, MOD_BLE, MY_MSG_TEST);
-
-    return 0;
-}
-
-/********************************************************************
-**函数名称:  cmd_buzzer_test
-**入口参数:  sh    ---        Shell句柄，用于输出信息
-            argc  ---        参数个数
-            argv  ---        参数数组，argv[1]为测试参数字符串
-**出口参数:  无
-**函数功能:  处理Buzzer测试命令，接收参数并发送测试消息到Buzzer模块
-**返 回 值:  0表示成功
-*********************************************************************/
-static int cmd_buzzer_test(const struct shell *sh, size_t argc, char **argv)
-{
-    int len;
-
-    if (argc < 2)
+    if (strcmp(name, "fifo") == 0)
     {
-        shell_error(sh, "Missing parameter");
-        return -EINVAL;
+        *source = IMU_INT_SRC_FIFO_WATERMARK;
     }
-
-    memset(g_shell_test_buff, 0, sizeof(g_shell_test_buff));
-
-    len = strlen(argv[1]);
-    memcpy(g_shell_test_buff, argv[1], len);
-    g_shell_test_buff[len] = 0;
-
-    shell_print(sh, "param: %s, len: %d", argv[1], len);
-    my_set_buzzer_mode(atoi(argv[1]));
-
-    return 0;
-}
-
-/********************************************************************
-**函数名称:  cmd_nfctrig_test
-**入口参数:  sh    ---        Shell句柄，用于输出信息
-            argc  ---        参数个数
-            argv  ---        参数数组，argv[1]为测试参数字符串
-**出口参数:  无
-**函数功能:  测试NFC联动指令，接收参数并执行对应的NFC联动命令
-**返 回 值:  0表示成功
-*********************************************************************/
-static int cmd_nfctrig_test(const struct shell *sh, size_t argc, char **argv)
-{
-    int len;
-    uint8_t card_index = 0;
-    uint16_t ret = 0;
-
-    if (argc < 2)
+    else if (strcmp(name, "any") == 0)
     {
-        shell_error(sh, "Missing parameter");
-        return -EINVAL;
+        *source = IMU_INT_SRC_ANY_MOTION;
     }
-
-    memset(g_shell_test_buff, 0, sizeof(g_shell_test_buff));
-
-    len = strlen(argv[1]);
-    memcpy(g_shell_test_buff, argv[1], len);
-    g_shell_test_buff[len] = 0;
-
-    shell_print(sh, "param: %s, len: %d", argv[1], len);
-
-    //执行NFC联动指令
-    ret = run_nfc_cmd(argv[1], &card_index);
-    if (ret)
+    else if (strcmp(name, "no") == 0)
     {
-        MY_LOG_INF("Command executed success: cmd_type:%d; command:%s", ret, gConfigParam.nfctrig_config.nfctrig_table.nfctrig_rule[card_index].nfctrig_command);
+        *source = IMU_INT_SRC_NO_MOTION;
+    }
+    else if (strcmp(name, "sig") == 0)
+    {
+        *source = IMU_INT_SRC_SIG_MOTION;
+    }
+    else if (strcmp(name, "tap") == 0)
+    {
+        *source = IMU_INT_SRC_TAP;
     }
     else
     {
-        MY_LOG_INF("Command executed fail: cmd_type:%d", ret);
+        return -EINVAL;
     }
-
 
     return 0;
 }
 
 /********************************************************************
-**函数名称:  cmd_nfc_swipe_test
-**入口参数:  sh    ---        Shell句柄，用于输出信息
-            argc  ---        参数个数
-            argv  ---        参数数组，argv[1]为测试参数字符串
+**函数名称:  qmi8658b_shell_config_motion
+**入口参数:  shell    ---        Shell实例指针（输入）
 **出口参数:  无
-**函数功能:  处理NFC刷卡测试命令，执行对应的NFC刷卡测试逻辑（模拟刷卡事件）
-**返 回 值:  0表示成功
+**函数功能:  写入任意运动、静止和显著运动测试配置
+**返回值:    0表示成功，负数表示失败
 *********************************************************************/
-static int cmd_nfc_swip_test(const struct shell *sh, size_t argc, char **argv)
+static int qmi8658b_shell_config_motion(const struct shell *shell)
 {
-    int len;
-    uint8_t select = 0;
-    // 定义 10 个测试二进制卡号
-    uint8_t test_data[10][7] = {
-        {0x88, 0x04, 0x0F, 0xBE, 0x99, 0x05, 0x0B}, // 1
-        {0x88, 0x04, 0x0F, 0xBE, 0x99, 0x05, 0xCC}, // 2
-        {0x88, 0x04, 0x0F, 0xBE}, // 3
-        {0x00}, // 4 (预留位置，可根据需要填充)
-        {0x00}, // 5
-        {0x00}, // 6
-        {0x00}, // 7
-        {0x00}, // 8
-        {0x00}, // 9
-        {0x00}  // 10
-    };
-    //对应的卡号长度，按序
-    uint8_t test_lens[] = {7, 7, 4, 1, 1, 1, 1, 1, 1, 1};
+    imu_motion_config_t config;
+    imu_result_t result;
 
-    if (argc < 2)
-    {
-        shell_error(sh, "Missing parameter");
-        return -EINVAL;
-    }
+    memset(&config, 0, sizeof(config));
+    config.any_motion_threshold_x = 3U;
+    config.any_motion_threshold_y = 3U;
+    config.any_motion_threshold_z = 3U;
+    config.no_motion_threshold_x = 3U;
+    config.no_motion_threshold_y = 3U;
+    config.no_motion_threshold_z = 3U;
+    config.any_motion_window = 1U;
+    config.no_motion_window = 10U;
+    config.sig_motion_wait_window = 100U;
+    config.sig_motion_confirm_window = 10U;
+    config.mode_ctrl = 0x77U;    // Any/No-Motion均使能三轴并使用OR逻辑
 
-    memset(g_shell_test_buff, 0, sizeof(g_shell_test_buff));
-
-    len = strlen(argv[1]);
-    select = atoi(argv[1]);
-    memcpy(g_shell_test_buff, argv[1], len);
-    g_shell_test_buff[len] = 0;
-
-    shell_print(sh, "param: %s, len: %d", argv[1], len);
-    if (select < 1 || select > 10)
-    {
-        shell_error(sh, "Invalid selection: %d (Range: 1-10)", select);
-        return -EINVAL;
-    }
-
-    //刷卡处理
-    handle_nfc_card_event(test_data[select - 1], test_lens[select-1]);
-    return 0;
+    result = imu_set_motion_config(&config);
+    qmi8658b_shell_print_result(shell, "motion_config", result);
+    return (result == IMU_SUCCESS) ? 0 : -EIO;
 }
 
 /********************************************************************
-**函数名称:  cmd_tag_scan_set_config
-**入口参数:  shell   ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
+**函数名称:  qmi8658b_shell_config_tap
+**入口参数:  shell    ---        Shell实例指针（输入）
 **出口参数:  无
-**函数功能:  配置 Tag 扫描参数
-**返 回 值:  0 表示成功，负数表示失败
-**使用示例:  app tagscan <mode> <scan_interval> <scan_length> <upload_interval>
+**函数功能:  写入单击和双击检测测试配置
+**返回值:    0表示成功，负数表示失败
 *********************************************************************/
-static int cmd_tag_scan_set_config(const struct shell *shell, size_t argc, char **argv)
+static int qmi8658b_shell_config_tap(const struct shell *shell)
 {
-    uint8_t mode;
-    uint32_t scan_interval;
-    uint32_t scan_length;
-    uint32_t upload_interval;
-    char *p_endptr;
+    imu_tap_config_t config;
+    imu_config_t sensor_config;
+    imu_result_t result;
 
-    if (argc != 5)
+    memset(&sensor_config, 0, sizeof(sensor_config));
+    sensor_config.acc_range = IMU_ACC_RANGE_8G;
+    sensor_config.acc_odr = IMU_ODR_250HZ;    // 数据手册建议敲击检测加速度ODR高于200Hz
+    sensor_config.gyr_range = IMU_GYR_RANGE_1024DPS;
+    sensor_config.gyr_odr = IMU_ODR_250HZ;
+    sensor_config.power_mode = IMU_POWER_NORMAL;
+    sensor_config.lpf_enable = true;
+    sensor_config.lpf_mode = IMU_LPF_MODE_0;
+    result = imu_set_config(&sensor_config);
+    qmi8658b_shell_print_result(shell, "tap_odr_config", result);
+    if (result != IMU_SUCCESS)
     {
-        shell_print(shell, "Usage: app tagscan <mode> <scan_interval> <scan_length> <upload_interval>");
-        shell_print(shell, "  mode            : Scan mode (0-3, 0=off 1=wakeup 2=period_cache 3=period_upload)");
-        shell_print(shell, "  scan_interval   : Scan interval (s), must > scan_length");
-        shell_print(shell, "  scan_length     : Scan length (s), must > 0");
-        shell_print(shell, "  upload_interval : Upload interval (s), mode 3 required");
-        return -EINVAL;
+        return -EIO;
     }
 
-    // 解析 mode 参数
-    mode = (uint8_t)strtoul(argv[1], &p_endptr, 10);
-    if (*p_endptr != '\0' || mode > 3)
-    {
-        shell_error(shell, "Invalid mode: %s, mode must be 0-3", argv[1]);
-        shell_print(shell, "  0: off");
-        shell_print(shell, "  1: wakeup_scan (scan on LTE wakeup)");
-        shell_print(shell, "  2: period_cache (periodic scan, upload on LTE wakeup)");
-        shell_print(shell, "  3: period_upload (periodic scan + periodic upload)");
-        return -EINVAL;
-    }
+    memset(&config, 0, sizeof(config));
+    config.peak_window = 10U;
+    config.priority = 0U;
+    config.tap_window = 32U;
+    config.double_tap_window = 64U;
+    config.alpha = 64U;
+    config.gamma = 64U;
+    config.peak_magnitude_threshold = 256U;
+    config.undefined_motion_threshold = 128U;
 
-    // 解析 scan_interval 参数
-    scan_interval = strtoul(argv[2], &p_endptr, 10);
-    if (*p_endptr != '\0' || scan_interval == 0 || scan_interval > 86400)
-    {
-        shell_error(shell, "Invalid scan_interval: %s, must be 1-86400 seconds", argv[2]);
-        return -EINVAL;
-    }
-
-    // 解析 scan_length 参数
-    scan_length = strtoul(argv[3], &p_endptr, 10);
-    if (*p_endptr != '\0' || scan_length == 0 || scan_length > 86400)
-    {
-        shell_error(shell, "Invalid scan_length: %s, must be 1-86400 seconds", argv[3]);
-        return -EINVAL;
-    }
-
-    // 解析 upload_interval 参数
-    upload_interval = strtoul(argv[4], &p_endptr, 10);
-    if (*p_endptr != '\0' || upload_interval > 86400)
-    {
-        shell_error(shell, "Invalid upload_interval: %s, must be 0-86400 seconds", argv[4]);
-        return -EINVAL;
-    }
-
-    // 校验 scan_interval 必须大于 scan_length
-    if (scan_interval <= scan_length)
-    {
-        shell_error(shell, "scan_interval (%u) must be greater than scan_length (%u)", scan_interval, scan_length);
-        return -EINVAL;
-    }
-
-    // 模式 3 要求 upload_interval 必须大于 0
-    if (mode == 3 && upload_interval == 0)
-    {
-        shell_error(shell, "Mode 3 (period_upload) requires upload_interval > 0");
-        return -EINVAL;
-    }
-
-    // 模式 3 要求 upload_interval 应该大于 scan_interval（避免频繁上报）
-    if (mode == 3 && upload_interval <= scan_interval)
-    {
-        shell_warn(shell, "Warning: upload_interval (%u) should be greater than scan_interval (%u) in mode 3", upload_interval, scan_interval);
-    }
-
-    my_scan_set_config(mode, scan_interval, scan_length, upload_interval);
-
-    shell_print(shell, "Tag scan config set OK:");
-    shell_print(shell, "  mode            = %d (%s)", mode,
-                mode == 0 ? "off" : (mode == 1 ? "wakeup_scan" : (mode == 2 ? "period_cache" : "period_upload")));
-    shell_print(shell, "  scan_interval   = %u s", scan_interval);
-    shell_print(shell, "  scan_length     = %u s", scan_length);
-    shell_print(shell, "  upload_interval = %u s", upload_interval);
-
-    return 0;
+    result = imu_set_tap_config(&config);
+    qmi8658b_shell_print_result(shell, "tap_config", result);
+    return (result == IMU_SUCCESS) ? 0 : -EIO;
 }
 
 /********************************************************************
-**函数名称:  cmd_alarm_test
-**入口参数:  sh      ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
+**函数名称:  qmi8658b_shell_cmd
+**入口参数:  shell    ---        Shell实例指针（输入）
+**           argc     ---        参数数量（输入）
+**           argv     ---        参数数组（输入）
 **出口参数:  无
-**函数功能:  测试发送告警消息到 LTE 模块
-**返 回 值:  0 表示成功，负数表示失败
-**使用示例:  app alarmtest <type> [info]
+**函数功能:  执行QMI8658B功能验证Shell测试命令
+**返回值:    0表示成功，负数表示失败
 *********************************************************************/
-static int cmd_alarm_test(const struct shell *sh, size_t argc, char **argv)
+static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **argv)
 {
-    int n_alarm_type;
-    const char *p_additional_info;
+    imu_data_t data;
+    imu_raw_data_t raw;
+    imu_chip_info_t chip_info;
+    imu_self_test_result_t self_test;
+    imu_motion_status_t motion_status;
+    imu_tap_status_t tap_status;
+    imu_fifo_config_t fifo_config;
+    imu_config_t config;
+    imu_feature_t feature;
+    imu_int_src_t int_source;
+    imu_result_t result;
+    uint8_t chip_id;
+    uint8_t status;
+    uint8_t reg_value;
+    uint8_t reg_verify;
+    uint8_t reg_test;
+    uint8_t gain_verify[6];
+    uint32_t timestamp;
+    int32_t temperature;
+    int16_t offset[3];
+    uint16_t frame_count;
+    uint16_t fifo_words_before;
+    uint16_t fifo_words_after;
+    uint16_t index;
+    uint8_t sensor_mask;
+    bool enable;
+    unsigned long count;
+    char *end_ptr;
 
-    if (argc < 2)
+    if (argc < 2U)
     {
-        shell_print(sh, "Usage: app alarmtest <type> [info]");
-        shell_print(sh, "  type: 0=OPEN, 1=ILLEGALUNLOCK, 2=LOCK, 3=MOTION,");
-        shell_print(sh, "        4=BATT, 5=CHARGE, 6=IMPACT, 7=SEPARATE,");
-        shell_print(sh, "        8=NFC, 9=CUT, 10=OTHER");
-        shell_print(sh, "  info: optional additional info string");
+        shell_print(shell, "Usage: qmi8658b <init|config|power|id|info|read|raw|temp|status|reg|int|fifo|motion|tap|feature|sync|offset|cali|gain|selftest>");
         return -EINVAL;
     }
 
-    // 解析告警类型
-    n_alarm_type = atoi(argv[1]);
-    if (n_alarm_type < 0 || n_alarm_type > ALARM_OTHER)
-    {
-        shell_error(sh, "Invalid alarm type: %d", n_alarm_type);
-        return -EINVAL;
-    }
-
-    // 获取附加信息（可选）
-    p_additional_info = (argc >= 3) ? argv[2] : NULL;
-
-    // 发送告警消息
-    send_alarm_message_to_lte((alarm_type_t)n_alarm_type, p_additional_info);
-
-    shell_print(sh, "Alarm message sent to LTE:");
-    shell_print(sh, "  type: %d", n_alarm_type);
-    shell_print(sh, "  info: %s", p_additional_info ? p_additional_info : "(none)");
-
-    return 0;
-}
-/********************************************************************
-**函数名称:  cmd_retransmit_check_test
-**入口参数:  sh    ---   Shell 实例句柄
-**           argc  ---   参数个数
-**           argv  ---   参数数组 (argv[1]: 指令内容, argv[2]: 可选参数)
-**出口参数:  无
-**函数功能:  Shell 测试命令：手动触发 LTE 重传检查机制
-**           调用 lte_send_cmd_with_retry 发送指令并启动重传
-**指令格式:  retransmit_test [cmd_string] [optional_param]
-**返回值说明:  0:      成功
-**           -EINVAL: 参数缺失
-**返 回 值:  int
-*********************************************************************/
-static int cmd_retransmit_check_test(const struct shell *sh, size_t argc, char **argv)
-{
-    int len;
-    char *p = NULL;
-
-    if (argc < 2)
-    {
-        shell_error(sh, "Missing parameter");
-        return -EINVAL;
-    }
-
-    memset(g_shell_test_buff, 0, sizeof(g_shell_test_buff));
-
-    len = strlen(argv[1]);
-    memcpy(g_shell_test_buff, argv[1], len);
-    g_shell_test_buff[len] = 0;
-
-    // 检查是否有第二个参数
-    if (argc >= 3)
-    {
-        p = argv[2];
-        shell_print(sh, "param2: %s", p);
-    }
-    shell_print(sh, "param1: %s, len: %d", argv[1], len);
-
-    lte_send_cmd_with_retry(argv[1], p);
-
-    return 0;
-}
-
-/********************************************************************
-**函数名称:  cmd_hardware_test
-**入口参数:  sh    ---   Shell 实例句柄
-**           argc  ---   参数个数
-**           argv  ---   参数数组 (argv[1]: 指令内容, argv[2]: 可选参数)
-**出口参数:  无
-**函数功能:  Shell 测试命令：手动触发硬件测试
-**指令格式:  hardware_ware [cmd_string] [optional_param]
-**返回值说明:  0:      成功
-**           -EINVAL: 参数缺失
-**返 回 值:  int
-*********************************************************************/
-static int cmd_hardware_test(const struct shell *sh, size_t argc, char **argv)
-{
-    int mode = 0;
-
-    // 锁电源使能测试
-    if (strcmp(argv[1], "lockpwren") == 0)
-    {
-        //lockpwren 0/1      (锁控制电源关/开)
-        mode = atoi(argv[2]);
-
-        motor_power_set(mode);
-    }
-    // G-Sensor电源使能测试
-    else if (strcmp(argv[1], "gsensorpwren") == 0)
-    {
-        //gsensorpwren 0/1      (G-Sensor控制电源关/开)
-        mode = atoi(argv[2]);
-
-        my_gsensor_pwr_on(mode);
-    }
-    // 充电电路开关
-    else if (strcmp(argv[1], "v_chg_en") == 0)
-    {
-        //v_chg_en 0/1      (充电电路关/开)
-        mode = atoi(argv[2]);
-
-        batt_enable(mode);
-    }
-    // 4G电源使能测试
-    else if (strcmp(argv[1], "4GPOWER") == 0)
-    {
-        //4GPOWER 0/1      (4G控制电源关/开)
-        mode = atoi(argv[2]);
-
-        my_lte_pwr_on(mode);
-    }
-}
-
-#if FS_STORE_TEST_ENABLE
-/********************************************************************
-**函数名称:  fs_test_parse_type
-**入口参数:  str       ---        类型字符串("tag"或"mac")（输入）
-**           type_ptr  ---        接收解析结果的指针（输出）
-**出口参数:  type_ptr  ---        存储解析出的数据类型
-**函数功能:  将shell输入的类型字符串解析为fs_data_type_t枚举
-**返 回 值:  0表示成功，-EINVAL表示非法类型
-*********************************************************************/
-static int fs_test_parse_type(const char *str, fs_data_type_t *type_ptr)
-{
-    if (strcmp(str, "tag") == 0)
-    {
-        *type_ptr = FS_TYPE_TAG;
-        return 0;
-    }
-    else if (strcmp(str, "mac") == 0)
-    {
-        *type_ptr = FS_TYPE_MAC;
-        return 0;
-    }
-
-    return -EINVAL;
-}
-
-/********************************************************************
-**函数名称:  fs_test_make_tag
-**入口参数:  rec_ptr   ---        待填充的TAG记录指针（输出）
-**           seq       ---        测试序号(编码进MAC地址用于回读校验)（输入）
-**出口参数:  rec_ptr   ---        存储构造好的可识别测试TAG记录
-**函数功能:  构造一条带唯一序号的测试TAG记录，序号小端编码进MAC地址前4字节
-**返 回 值:  无
-*********************************************************************/
-static void fs_test_make_tag(tag_scan_result_t *rec_ptr, uint32_t seq)
-{
-    memset(rec_ptr, 0, sizeof(tag_scan_result_t));
-
-    // 序号小端编码进MAC地址前4字节，回读时据此校验顺序与内容
-    rec_ptr->addr.a.val[0] = (uint8_t)(seq & 0xFF);
-    rec_ptr->addr.a.val[1] = (uint8_t)((seq >> 8) & 0xFF);
-    rec_ptr->addr.a.val[2] = (uint8_t)((seq >> 16) & 0xFF);
-    rec_ptr->addr.a.val[3] = (uint8_t)((seq >> 24) & 0xFF);
-    rec_ptr->addr.a.val[4] = 0xAA;          // 固定标记，便于人工辨识
-    rec_ptr->addr.a.val[5] = 0x55;
-
-    rec_ptr->battery_percent = (uint8_t)(seq & 0x7F);
-    rec_ptr->rssi = (int8_t)(-40 - (int)(seq & 0x1F));
-    snprintf(rec_ptr->name, sizeof(rec_ptr->name), "TAG%u", seq);
-    rec_ptr->uuid_len = 0;
-    rec_ptr->ff_data_len = 0;
-}
-
-/********************************************************************
-**函数名称:  fs_test_make_mac
-**入口参数:  rec_ptr   ---        待填充的MAC记录指针（输出）
-**           seq       ---        测试序号(编码进MAC地址用于回读校验)（输入）
-**出口参数:  rec_ptr   ---        存储构造好的可识别测试MAC记录
-**函数功能:  构造一条带唯一序号的测试透传MAC记录，序号小端编码进MAC地址前4字节
-**返 回 值:  无
-*********************************************************************/
-static void fs_test_make_mac(tran_mac_result_item_t *rec_ptr, uint32_t seq)
-{
-    memset(rec_ptr, 0, sizeof(tran_mac_result_item_t));
-
-    // 序号小端编码进MAC地址前4字节
-    rec_ptr->addr.a.val[0] = (uint8_t)(seq & 0xFF);
-    rec_ptr->addr.a.val[1] = (uint8_t)((seq >> 8) & 0xFF);
-    rec_ptr->addr.a.val[2] = (uint8_t)((seq >> 16) & 0xFF);
-    rec_ptr->addr.a.val[3] = (uint8_t)((seq >> 24) & 0xFF);
-    rec_ptr->addr.a.val[4] = 0xBB;          // 固定标记，便于人工辨识
-    rec_ptr->addr.a.val[5] = 0x66;
-
-    // 广播数据填2字节，内容为序号低16位，便于回读校验
-    rec_ptr->adv_data_len = 2;
-    rec_ptr->adv_data[0] = (uint8_t)(seq & 0xFF);
-    rec_ptr->adv_data[1] = (uint8_t)((seq >> 8) & 0xFF);
-}
-
-/********************************************************************
-**函数名称:  fs_test_decode_seq
-**入口参数:  val_ptr   ---        MAC地址字节数组指针（输入）
-**出口参数:  无
-**函数功能:  从MAC地址前4字节小端解码出测试序号，用于回读校验
-**返 回 值:  解码出的测试序号
-*********************************************************************/
-static uint32_t fs_test_decode_seq(const uint8_t *val_ptr)
-{
-    return (uint32_t)val_ptr[0] | ((uint32_t)val_ptr[1] << 8) |
-           ((uint32_t)val_ptr[2] << 16) | ((uint32_t)val_ptr[3] << 24);
-}
-
-/********************************************************************
-**函数名称:  cmd_fs_test
-**入口参数:  sh      ---        Shell 实例指针
-**           argc    ---        参数数量
-**           argv    ---        参数数组
-**出口参数:  无
-**函数功能:  FLASH循环存储模块测试命令，支持落盘/读取/提交/回退/清空/状态查看
-**           等子命令，用于验证整个存储-上报闭环及循环覆盖等边界场景
-**返 回 值:  0表示成功，负值表示失败
-**使用示例:  app fs push tag 100   app fs info tag   app fs read mac 0
-*********************************************************************/
-static int cmd_fs_test(const struct shell *sh, size_t argc, char **argv)
-{
-    fs_data_type_t type;
-    fs_debug_info_t info;
-    tag_scan_result_t tag_rec;
-    tran_mac_result_item_t mac_rec;
-    uint8_t read_buf[128];      // 读取缓冲(取两类记录中较大者)
-    uint32_t count;
-    uint32_t i;
-    uint32_t seq;
-    uint32_t prev_seq;
-    bool sorted_ok;
-    int ret;
-    int read_cnt;
-    int rd;
-
-    if (argc < 2)
-    {
-        shell_print(sh, "Usage: app fs <subcmd> [args]");
-        shell_print(sh, "  init                     - Init flash store module");
-        shell_print(sh, "  info  <tag|mac>          - Show region internal state");
-        shell_print(sh, "  count <tag|mac>          - Show pending record count");
-        shell_print(sh, "  push  <tag|mac> <n>      - Push n test records");
-        shell_print(sh, "  fill  <tag|mac> <secs>   - Push records to fill <secs> sectors");
-        shell_print(sh, "  begin <tag|mac>          - Begin an upload session");
-        shell_print(sh, "  read  <tag|mac> [n]      - Read n records (0=read all), no commit");
-        shell_print(sh, "  commit <tag|mac>         - Commit current read batch");
-        shell_print(sh, "  rewind <tag|mac>         - Rewind read cursor to last commit");
-        shell_print(sh, "  clear <tag|mac>          - Clear region (wipe pointers)");
-        shell_print(sh, "  sorttest <tag|mac> <n>   - Verify timestamp asc sort on flush");
-        return -EINVAL;
-    }
-
-    /* init子命令无type参数，单独处理 */
     if (strcmp(argv[1], "init") == 0)
     {
-        ret = my_flash_store_init();
-        shell_print(sh, "flash store init ret=%d", ret);
-        return ret;
+        result = imu_init(NULL);
+        qmi8658b_shell_print_result(shell, "init", result);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
     }
 
-    /* 其余子命令均需type参数 */
-    if (argc < 3 || fs_test_parse_type(argv[2], &type) != 0)
+    if (strcmp(argv[1], "id") == 0)
     {
-        shell_error(sh, "need type arg: tag | mac");
-        return -EINVAL;
+        result = imu_get_chip_id(&chip_id);
+        qmi8658b_shell_print_result(shell, "chip_id", result);
+        if (result == IMU_SUCCESS)
+        {
+            shell_print(shell, "chip_id=0x%02X, expected=0x05", chip_id);
+        }
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
     }
 
     if (strcmp(argv[1], "info") == 0)
     {
-        ret = my_flash_store_get_debug_info(type, &info);
-        if (ret != 0)
+        result = imu_get_chip_info(&chip_info);
+        qmi8658b_shell_print_result(shell, "chip_info", result);
+        if (result == IMU_SUCCESS)
         {
-            shell_error(sh, "get debug info fail ret=%d", ret);
-            return ret;
+            shell_print(shell, "firmware=%02X.%02X.%02X, usid=%02X%02X%02X%02X%02X%02X",
+                        chip_info.firmware_version[0], chip_info.firmware_version[1], chip_info.firmware_version[2],
+                        chip_info.usid[0], chip_info.usid[1], chip_info.usid[2],
+                        chip_info.usid[3], chip_info.usid[4], chip_info.usid[5]);
         }
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
 
-        shell_print(sh, "=== FS %s region state ===", argv[2]);
-        shell_print(sh, "  wr_sector       = %u", info.wr_sector);
-        shell_print(sh, "  rd_sector       = %u", info.rd_sector);
-        shell_print(sh, "  valid_sectors   = %u / %u", info.valid_sectors, info.region_sectors);
-        shell_print(sh, "  rd_rec_idx      = %u", info.rd_rec_idx);
-        shell_print(sh, "  seq_counter     = %u", info.seq_counter);
-        shell_print(sh, "  staging_count   = %u / %u", info.staging_count, info.rec_per_sector);
-        shell_print(sh, "  upload_active   = %d", info.upload_active);
-        shell_print(sh, "  staging_snap    = %u", info.upload_staging_snap);
-        shell_print(sh, "  read_offset     = %u", info.read_offset);
-        shell_print(sh, "  staging_read    = %u", info.staging_read_idx);
-        shell_print(sh, "  pending_count   = %u", info.pending_count);
-        return 0;
-    }
-    else if (strcmp(argv[1], "count") == 0)
+    if (strcmp(argv[1], "config") == 0)
     {
-        count = my_flash_store_pending_count(type);
-        shell_print(sh, "FS %s pending count = %u", argv[2], count);
-        return 0;
-    }
-    else if (strcmp(argv[1], "push") == 0)
-    {
-        if (argc < 4)
+        if ((argc != 3U) || ((strcmp(argv[2], "normal") != 0) && (strcmp(argv[2], "low") != 0)))
         {
-            shell_error(sh, "Usage: app fs push <tag|mac> <n>");
+            shell_error(shell, "Usage: qmi8658b config <normal|low>");
             return -EINVAL;
         }
 
-        count = strtoul(argv[3], NULL, 10);
-        // 用模块内seq_counter作为起始序号，保证多次push序号连续不重复
-        my_flash_store_get_debug_info(type, &info);
-        seq = my_flash_store_pending_count(type) + info.rd_rec_idx;
-
-        for (i = 0; i < count; i++)
+        config.acc_range = IMU_ACC_RANGE_8G;
+        config.gyr_range = IMU_GYR_RANGE_1024DPS;
+        config.gyr_odr = IMU_ODR_125HZ;
+        config.lpf_enable = true;
+        config.lpf_mode = IMU_LPF_MODE_0;
+        if (strcmp(argv[2], "low") == 0)
         {
-            if (type == FS_TYPE_TAG)
-            {
-                fs_test_make_tag(&tag_rec, seq + i);
-                ret = my_flash_store_push_tag(&tag_rec);
-            }
-            else
-            {
-                fs_test_make_mac(&mac_rec, seq + i);
-                ret = my_flash_store_push_mac(&mac_rec);
-            }
+            config.acc_odr = IMU_ODR_21HZ_LP;
+            config.power_mode = IMU_POWER_LOW_POWER;
+        }
+        else
+        {
+            config.acc_odr = IMU_ODR_125HZ;
+            config.power_mode = IMU_POWER_NORMAL;
+        }
 
-            if (ret != 0)
+        result = imu_set_config(&config);
+        if (result == IMU_SUCCESS)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_CTRL2, &reg_value, 1U);
+        }
+        if (result == IMU_SUCCESS)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_CTRL3, &reg_verify, 1U);
+        }
+        if (result == IMU_SUCCESS)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_CTRL7, &status, 1U);
+        }
+
+        if (result == IMU_SUCCESS)
+        {
+            shell_print(shell, "CTRL2=0x%02X, CTRL3=0x%02X, CTRL7=0x%02X", reg_value, reg_verify, status);
+            if ((strcmp(argv[2], "low") == 0) &&
+                ((reg_value != 0x2DU) || (reg_verify != 0x36U) || (status != QMI8658B_TEST_SENSOR_ACC)))
             {
-                shell_warn(sh, "push #%u ret=%d (stop)", i, ret);
-                break;
+                result = IMU_ERROR_COMM;
+            }
+            else if ((strcmp(argv[2], "normal") == 0) &&
+                     ((reg_value != 0x26U) || (reg_verify != 0x36U) ||
+                      (status != (QMI8658B_TEST_SENSOR_ACC | QMI8658B_TEST_SENSOR_GYR))))
+            {
+                result = IMU_ERROR_COMM;
             }
         }
 
-        shell_print(sh, "pushed %u/%u %s records (start seq=%u)", i, count, argv[2], seq);
-        return 0;
+        qmi8658b_shell_print_result(shell, "set_config", result);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
     }
-    else if (strcmp(argv[1], "fill") == 0)
+
+    if (strcmp(argv[1], "power") == 0)
     {
-        if (argc < 4)
+        if (argc != 3U)
         {
-            shell_error(sh, "Usage: app fs fill <tag|mac> <sectors>");
+            shell_error(shell, "Usage: qmi8658b power <normal|snooze|suspend|down>");
             return -EINVAL;
         }
 
-        // 计算需要push的记录条数 = 目标扇区数 × 每扇区记录数
-        my_flash_store_get_debug_info(type, &info);
-        count = strtoul(argv[3], NULL, 10) * info.rec_per_sector;
-        seq = my_flash_store_pending_count(type) + info.rd_rec_idx;
-
-        for (i = 0; i < count; i++)
+        if (strcmp(argv[2], "normal") == 0)
         {
-            if (type == FS_TYPE_TAG)
-            {
-                fs_test_make_tag(&tag_rec, seq + i);
-                ret = my_flash_store_push_tag(&tag_rec);
-            }
-            else
-            {
-                fs_test_make_mac(&mac_rec, seq + i);
-                ret = my_flash_store_push_mac(&mac_rec);
-            }
+            result = imu_set_power_mode(IMU_POWER_NORMAL);
+        }
+        else if (strcmp(argv[2], "snooze") == 0)
+        {
+            result = imu_set_power_mode(IMU_POWER_GYRO_SNOOZE);
+        }
+        else if (strcmp(argv[2], "suspend") == 0)
+        {
+            result = imu_set_power_mode(IMU_POWER_SUSPEND);
+        }
+        else if (strcmp(argv[2], "down") == 0)
+        {
+            result = imu_set_power_mode(IMU_POWER_DOWN);
+        }
+        else
+        {
+            shell_error(shell, "Usage: qmi8658b power <normal|snooze|suspend|down>");
+            return -EINVAL;
+        }
 
-            if (ret != 0)
+        qmi8658b_shell_print_result(shell, "power", result);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "temp") == 0)
+    {
+        result = imu_read_temperature(&temperature);
+        qmi8658b_shell_print_result(shell, "temperature", result);
+        if (result == IMU_SUCCESS)
+        {
+            shell_print(shell, "temp_x100=%ld", (long)temperature);
+        }
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if ((strcmp(argv[1], "read") == 0) || (strcmp(argv[1], "raw") == 0))
+    {
+        count = 1U;
+        if (argc == 3U)
+        {
+            count = strtoul(argv[2], &end_ptr, 10);
+            if ((*end_ptr != '\0') || (count == 0U) || (count > 10U))
             {
-                shell_warn(sh, "fill #%u ret=%d (stop)", i, ret);
-                break;
+                shell_error(shell, "count must be 1 to 10");
+                return -EINVAL;
             }
         }
 
-        shell_print(sh, "filled %u %s records (%s sectors, start seq=%u)",
-                    i, argv[2], argv[3], seq);
-        return 0;
-    }
-    else if (strcmp(argv[1], "begin") == 0)
-    {
-        my_flash_store_upload_begin(type);
-        shell_print(sh, "upload session begin for %s", argv[2]);
-        return 0;
-    }
-    else if (strcmp(argv[1], "read") == 0)
-    {
-        // 读取条数：0或缺省表示读到无数据为止
-        count = (argc >= 4) ? strtoul(argv[3], NULL, 10) : 0;
-        read_cnt = 0;
-
-        while (count == 0 || (uint32_t)read_cnt < count)
+        for (index = 0U; index < count; index++)
         {
-            ret = my_flash_store_read_next(type, read_buf);
-            if (ret <= 0)
+            if (strcmp(argv[1], "read") == 0)
             {
-                // 0表示读尽，负值表示错误
-                if (ret < 0)
+                result = imu_read(&data);
+                if (result == IMU_SUCCESS)
                 {
-                    shell_error(sh, "read_next ret=%d", ret);
+                    shell_print(shell, "[%u] acc(mg)=%ld,%ld,%ld gyr(mdps)=%ld,%ld,%ld temp_x100=%ld",
+                                index, (long)data.acc_x, (long)data.acc_y, (long)data.acc_z,
+                                (long)data.gyr_x, (long)data.gyr_y, (long)data.gyr_z,
+                                (long)data.temperature);
                 }
-                break;
-            }
-
-            // 从回读记录的MAC地址解码序号，校验顺序与内容
-            if (type == FS_TYPE_TAG)
-            {
-                seq = fs_test_decode_seq(((tag_scan_result_t *)read_buf)->addr.a.val);
-                shell_print(sh, "  [%d] TAG seq=%u rssi=%d batt=%u",
-                            read_cnt, seq,
-                            ((tag_scan_result_t *)read_buf)->rssi,
-                            ((tag_scan_result_t *)read_buf)->battery_percent);
             }
             else
             {
-                seq = fs_test_decode_seq(((tran_mac_result_item_t *)read_buf)->addr.a.val);
-                shell_print(sh, "  [%d] MAC seq=%u adv_len=%u",
-                            read_cnt, seq,
-                            ((tran_mac_result_item_t *)read_buf)->adv_data_len);
+                result = imu_read_raw(&raw);
+                if (result == IMU_SUCCESS)
+                {
+                    shell_print(shell, "[%u] temp=%d acc=%d,%d,%d gyr=%d,%d,%d", index, raw.temperature,
+                                raw.acc_x, raw.acc_y, raw.acc_z, raw.gyr_x, raw.gyr_y, raw.gyr_z);
+                }
             }
 
-            read_cnt++;
+            if (result != IMU_SUCCESS)
+            {
+                qmi8658b_shell_print_result(shell, argv[1], result);
+                return -EIO;
+            }
         }
 
-        shell_print(sh, "read %d %s records (call 'commit' to confirm, 'rewind' to resend)",
-                    read_cnt, argv[2]);
+        qmi8658b_shell_print_result(shell, argv[1], IMU_SUCCESS);
         return 0;
     }
-    else if (strcmp(argv[1], "commit") == 0)
+
+    if (strcmp(argv[1], "status") == 0)
     {
-        ret = my_flash_store_commit(type);
-        shell_print(sh, "commit %s ret=%d", argv[2], ret);
-        return ret;
-    }
-    else if (strcmp(argv[1], "rewind") == 0)
-    {
-        my_flash_store_rewind(type);
-        shell_print(sh, "rewind %s done", argv[2]);
-        return 0;
-    }
-    else if (strcmp(argv[1], "clear") == 0)
-    {
-        my_flash_store_clear(type);
-        shell_print(sh, "clear %s done", argv[2]);
-        return 0;
-    }
-    else if (strcmp(argv[1], "sorttest") == 0)
-    {
-        if (argc < 4)
+        result = imu_read_status(&status);
+        qmi8658b_shell_print_result(shell, "status", result);
+        if (result == IMU_SUCCESS)
         {
-            shell_error(sh, "Usage: app fs sorttest <tag|mac> <n>");
+            shell_print(shell, "STATUS0=0x%02X, acc_drdy=%u, gyr_drdy=%u", status, status & 0x01U, (status >> 1) & 0x01U);
+        }
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "reg") == 0)
+    {
+        if ((argc != 3U) || (strcmp(argv[2], "ctrl1") != 0))
+        {
+            shell_error(shell, "Usage: qmi8658b reg ctrl1");
             return -EINVAL;
         }
 
-        count = strtoul(argv[3], NULL, 10);
-
-        // 清空目标区，注入count条乱序时间戳记录并经真实落盘接口排序入FLASH
-        my_flash_store_clear(type);
-        ret = my_scan_test_flush_sort((uint8_t)type, (uint16_t)count);
-        if (ret < 0)
+        result = imu_read_reg(QMI8658B_TEST_REG_CTRL1, &reg_value, 1U);
+        if (result != IMU_SUCCESS)
         {
-            shell_error(sh, "flush sort inject fail ret=%d", ret);
-            return ret;
+            qmi8658b_shell_print_result(shell, "reg_read", result);
+            return -EIO;
         }
 
-        // 回读校验：注入时序号与时间戳反序，排序正确则回读序号应严格递减
-        my_flash_store_upload_begin(type);
-        read_cnt = 0;
-        prev_seq = 0;
-        sorted_ok = true;
-
-        while (1)
+        reg_test = (uint8_t)(reg_value ^ QMI8658B_TEST_CTRL1_FIFO_INT1);
+        result = imu_write_reg(QMI8658B_TEST_REG_CTRL1, &reg_test, 1U);
+        if (result == IMU_SUCCESS)
         {
-            rd = my_flash_store_read_next(type, read_buf);
-            if (rd <= 0)
-            {
-                break;
-            }
+            result = imu_read_reg(QMI8658B_TEST_REG_CTRL1, &reg_verify, 1U);
+        }
+        if (imu_write_reg(QMI8658B_TEST_REG_CTRL1, &reg_value, 1U) != IMU_SUCCESS)
+        {
+            result = IMU_ERROR_COMM;
+        }
 
-            if (type == FS_TYPE_TAG)
+        if (result == IMU_SUCCESS)
+        {
+            shell_print(shell, "CTRL1=0x%02X, test=0x%02X, verify=0x%02X", reg_value, reg_test, reg_verify);
+            if (reg_test != reg_verify)
             {
-                seq = fs_test_decode_seq(((tag_scan_result_t *)read_buf)->addr.a.val);
+                shell_error(shell, "CTRL1 read-back mismatch");
+                result = IMU_ERROR_COMM;
+            }
+        }
+        qmi8658b_shell_print_result(shell, "reg_read_write", result);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "int") == 0)
+    {
+        if (argc < 3U)
+        {
+            shell_error(shell, "Usage: qmi8658b int <callback|clear|count|status|pin|map>");
+            return -EINVAL;
+        }
+
+        if (strcmp(argv[2], "callback") == 0)
+        {
+            s_qmi8658b_int_count = 0U;
+            result = imu_register_int_callback(qmi8658b_shell_int_callback);
+            qmi8658b_shell_print_result(shell, "int_callback", result);
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "count") == 0)
+        {
+            shell_print(shell, "int_count=%lu", (unsigned long)s_qmi8658b_int_count);
+            return 0;
+        }
+
+        if (strcmp(argv[2], "clear") == 0)
+        {
+            s_qmi8658b_int_count = 0U;
+            shell_print(shell, "int_count=0");
+            return 0;
+        }
+
+        if (strcmp(argv[2], "status") == 0)
+        {
+            result = imu_read_int_status(&status);
+            qmi8658b_shell_print_result(shell, "int_status", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "STATUSINT=0x%02X", status);
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if ((strcmp(argv[2], "pin") == 0) && (argc == 4U))
+        {
+            if (strcmp(argv[3], "on") == 0)
+            {
+                result = imu_int_pin_enable(IMU_INT_PIN1, true);
+            }
+            else if (strcmp(argv[3], "off") == 0)
+            {
+                result = imu_int_pin_enable(IMU_INT_PIN1, false);
             }
             else
             {
-                seq = fs_test_decode_seq(((tran_mac_result_item_t *)read_buf)->addr.a.val);
+                shell_error(shell, "Usage: qmi8658b int pin <on|off>");
+                return -EINVAL;
             }
 
-            shell_print(sh, "  [%d] seq=%u", read_cnt, seq);
-
-            // 从第二条起，序号应小于前一条(降序)，否则排序未生效
-            if (read_cnt > 0 && seq >= prev_seq)
-            {
-                sorted_ok = false;
-            }
-            prev_seq = seq;
-            read_cnt++;
+            qmi8658b_shell_print_result(shell, "int_pin", result);
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
         }
 
-        // 退回读游标，本测试数据不算正式上报
-        my_flash_store_rewind(type);
-
-        if (read_cnt != (int)ret)
+        if ((strcmp(argv[2], "map") == 0) && (argc == 4U))
         {
-            shell_warn(sh, "read back %d but injected %d", read_cnt, ret);
-            sorted_ok = false;
+            if (qmi8658b_shell_parse_int_source(argv[3], &int_source) != 0)
+            {
+                shell_error(shell, "Usage: qmi8658b int map <fifo|any|no|sig|tap>");
+                return -EINVAL;
+            }
+
+            result = imu_int_map(int_source, IMU_INT_PIN1);
+            qmi8658b_shell_print_result(shell, "int_map", result);
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
         }
 
-        shell_print(sh, "sorttest %s: injected %d, read %d, sorted=%s",
-                    argv[2], ret, read_cnt, sorted_ok ? "PASS" : "FAIL");
-        return sorted_ok ? 0 : -EIO;
+        shell_error(shell, "Usage: qmi8658b int <callback|clear|count|status|pin|map>");
+        return -EINVAL;
     }
 
-    shell_error(sh, "unknown subcmd: %s", argv[1]);
+    if (strcmp(argv[1], "fifo") == 0)
+    {
+        if (argc != 3U)
+        {
+            shell_error(shell, "Usage: qmi8658b fifo <start|read|flush|flush_read|status>");
+            return -EINVAL;
+        }
+
+        if (strcmp(argv[2], "start") == 0)
+        {
+            fifo_config.acc_enable = true;
+            fifo_config.gyr_enable = true;
+            fifo_config.mode = IMU_FIFO_STREAM;
+            fifo_config.fifo_size = IMU_FIFO_SIZE_128;
+            fifo_config.watermark = 32U;
+            fifo_config.int_pin = IMU_INT_PIN1;
+            result = imu_fifo_config(&fifo_config);
+            qmi8658b_shell_print_result(shell, "fifo_start", result);
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "read") == 0)
+        {
+            result = qmi8658b_shell_get_fifo_words(&fifo_words_before);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "fifo_words_before=%u", fifo_words_before);
+                if (fifo_words_before == 0U)
+                {
+                    result = IMU_ERROR_PARAM;
+                }
+            }
+            if (result == IMU_SUCCESS)
+            {
+                result = imu_fifo_read(s_qmi8658b_fifo_frames, QMI8658B_TEST_FIFO_MAX_FRAMES, &frame_count);
+            }
+            if ((result == IMU_SUCCESS) && (frame_count == 0U))
+            {
+                result = IMU_ERROR_COMM;
+            }
+            qmi8658b_shell_print_result(shell, "fifo_read", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "fifo_frames=%u", frame_count);
+                for (index = 0U; index < frame_count; index++)
+                {
+                    shell_print(shell, "[%u] acc=%d,%d,%d gyr=%d,%d,%d", index,
+                                s_qmi8658b_fifo_frames[index].acc_x, s_qmi8658b_fifo_frames[index].acc_y,
+                                s_qmi8658b_fifo_frames[index].acc_z, s_qmi8658b_fifo_frames[index].gyr_x,
+                                s_qmi8658b_fifo_frames[index].gyr_y, s_qmi8658b_fifo_frames[index].gyr_z);
+                }
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "flush") == 0)
+        {
+            result = imu_fifo_flush();
+            qmi8658b_shell_print_result(shell, "fifo_flush", result);
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "flush_read") == 0)
+        {
+            result = qmi8658b_shell_get_fifo_words(&fifo_words_before);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "fifo_words_before_flush=%u", fifo_words_before);
+            }
+            if (result == IMU_SUCCESS)
+            {
+                result = imu_fifo_flush();
+            }
+            qmi8658b_shell_print_result(shell, "fifo_flush", result);
+            if (result != IMU_SUCCESS)
+            {
+                return -EIO;
+            }
+
+            result = qmi8658b_shell_get_fifo_words(&fifo_words_after);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "fifo_words_after_flush=%u", fifo_words_after);
+                // 125Hz 连续采样下，CTRL9 清空命令执行期间可能新进入一个六轴样本（6个字）
+                if ((fifo_words_before == 0U) || (fifo_words_after > 6U))
+                {
+                    result = IMU_ERROR_PARAM;
+                }
+            }
+            if (result == IMU_SUCCESS)
+            {
+                result = imu_fifo_read(s_qmi8658b_fifo_frames, QMI8658B_TEST_FIFO_MAX_FRAMES, &frame_count);
+            }
+            qmi8658b_shell_print_result(shell, "fifo_read_after_flush", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "fifo_frames=%u", frame_count);
+            }
+
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "status") == 0)
+        {
+            result = imu_fifo_get_status(&status);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "FIFO_STATUS=0x%02X", status);
+                if ((status & (QMI8658B_TEST_FIFO_STATUS_NOT_EMPTY | QMI8658B_TEST_FIFO_STATUS_WTM)) == 0U)
+                {
+                    result = IMU_ERROR_PARAM;
+                }
+            }
+            qmi8658b_shell_print_result(shell, "fifo_status", result);
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        shell_error(shell, "Usage: qmi8658b fifo <start|read|flush|flush_read|status>");
+        return -EINVAL;
+    }
+
+    if ((strcmp(argv[1], "motion") == 0) || (strcmp(argv[1], "tap") == 0))
+    {
+        if (argc != 3U)
+        {
+            shell_error(shell, "Usage: qmi8658b motion <config|status> or qmi8658b tap <config|status>");
+            return -EINVAL;
+        }
+
+        if (strcmp(argv[2], "config") == 0)
+        {
+            return (strcmp(argv[1], "motion") == 0) ? qmi8658b_shell_config_motion(shell) : qmi8658b_shell_config_tap(shell);
+        }
+
+        if ((strcmp(argv[1], "motion") == 0) && (strcmp(argv[2], "status") == 0))
+        {
+            result = imu_get_motion_status(&motion_status);
+            qmi8658b_shell_print_result(shell, "motion_status", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "any=%u no=%u sig=%u tap=%u", motion_status.any_motion, motion_status.no_motion,
+                            motion_status.sig_motion, motion_status.tap);
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if ((strcmp(argv[1], "tap") == 0) && (strcmp(argv[2], "status") == 0))
+        {
+            result = imu_get_tap_status(&tap_status);
+            qmi8658b_shell_print_result(shell, "tap_status", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "number=%u axis=%u negative=%u", tap_status.tap_number, tap_status.axis,
+                            tap_status.negative_polarity);
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        shell_error(shell, "Usage: qmi8658b motion <config|status> or qmi8658b tap <config|status>");
+        return -EINVAL;
+    }
+
+    if (strcmp(argv[1], "feature") == 0)
+    {
+        if ((argc != 4U) || (qmi8658b_shell_parse_feature(argv[2], &feature) != 0))
+        {
+            shell_error(shell, "Usage: qmi8658b feature <any|no|sig|tap> <on|off>");
+            return -EINVAL;
+        }
+
+        if (strcmp(argv[3], "on") == 0)
+        {
+            enable = true;
+        }
+        else if (strcmp(argv[3], "off") == 0)
+        {
+            enable = false;
+        }
+        else
+        {
+            shell_error(shell, "feature state must be on or off");
+            return -EINVAL;
+        }
+
+        result = imu_feature_enable(feature, enable);
+        qmi8658b_shell_print_result(shell, "feature", result);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "sync") == 0)
+    {
+        if (argc != 3U)
+        {
+            shell_error(shell, "Usage: qmi8658b sync <on|off>");
+            return -EINVAL;
+        }
+
+        enable = (strcmp(argv[2], "on") == 0);
+        if (!enable && (strcmp(argv[2], "off") != 0))
+        {
+            shell_error(shell, "sync state must be on or off");
+            return -EINVAL;
+        }
+
+        result = imu_set_sync_sample(enable);
+        qmi8658b_shell_print_result(shell, "sync", result);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "cali") == 0)
+    {
+        result = imu_run_calibration(s_qmi8658b_gyro_gain);
+        qmi8658b_shell_print_result(shell, "calibration", result);
+        if (result == IMU_SUCCESS)
+        {
+            s_qmi8658b_gyro_gain_valid = true;
+            shell_print(shell, "gyro_gain=%02X%02X%02X%02X%02X%02X", s_qmi8658b_gyro_gain[0], s_qmi8658b_gyro_gain[1],
+                        s_qmi8658b_gyro_gain[2], s_qmi8658b_gyro_gain[3], s_qmi8658b_gyro_gain[4], s_qmi8658b_gyro_gain[5]);
+        }
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "gain") == 0)
+    {
+        if ((argc != 3U) || (strcmp(argv[2], "apply") != 0))
+        {
+            shell_error(shell, "Usage: qmi8658b gain apply");
+            return -EINVAL;
+        }
+
+        if (!s_qmi8658b_gyro_gain_valid)
+        {
+            shell_error(shell, "Run qmi8658b cali successfully before gain apply");
+            return -EACCES;
+        }
+
+        result = imu_apply_gyro_gain(s_qmi8658b_gyro_gain);
+        if (result == IMU_SUCCESS)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_CAL1_L, gain_verify, sizeof(gain_verify));
+        }
+        if ((result == IMU_SUCCESS) && (memcmp(s_qmi8658b_gyro_gain, gain_verify, sizeof(gain_verify)) != 0))
+        {
+            result = IMU_ERROR_COMM;
+        }
+        qmi8658b_shell_print_result(shell, "gain_apply", result);
+        if (result == IMU_SUCCESS)
+        {
+            shell_print(shell, "gyro_gain_verify=%02X%02X%02X%02X%02X%02X", gain_verify[0], gain_verify[1], gain_verify[2],
+                        gain_verify[3], gain_verify[4], gain_verify[5]);
+        }
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "offset") == 0)
+    {
+        if ((argc != 3U) || (strcmp(argv[2], "delta_zero") != 0))
+        {
+            shell_error(shell, "Usage: qmi8658b offset delta_zero");
+            return -EINVAL;
+        }
+
+        offset[0] = 0;
+        offset[1] = 0;
+        offset[2] = 0;
+        result = imu_set_acc_offset(offset);
+        if (result == IMU_SUCCESS)
+        {
+            result = imu_set_gyr_offset(offset);
+        }
+
+        qmi8658b_shell_print_result(shell, "offset_delta_zero", result);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "selftest") == 0)
+    {
+        if (argc != 3U)
+        {
+            shell_error(shell, "Usage: qmi8658b selftest <acc|gyr|all>");
+            return -EINVAL;
+        }
+
+        if (strcmp(argv[2], "acc") == 0)
+        {
+            sensor_mask = QMI8658B_TEST_SENSOR_ACC;
+        }
+        else if (strcmp(argv[2], "gyr") == 0)
+        {
+            sensor_mask = QMI8658B_TEST_SENSOR_GYR;
+        }
+        else if (strcmp(argv[2], "all") == 0)
+        {
+            sensor_mask = QMI8658B_TEST_SENSOR_ACC | QMI8658B_TEST_SENSOR_GYR;
+        }
+        else
+        {
+            shell_error(shell, "selftest target must be acc, gyr or all");
+            return -EINVAL;
+        }
+
+        memset(&self_test, 0, sizeof(self_test));
+        result = imu_run_self_test(sensor_mask, &self_test);
+        qmi8658b_shell_print_result(shell, "selftest", result);
+        shell_print(shell, "acc_pass=%u, acc_mg=%ld,%ld,%ld", self_test.acc_pass, (long)self_test.acc_x_mg,
+                    (long)self_test.acc_y_mg, (long)self_test.acc_z_mg);
+        shell_print(shell, "gyr_pass=%u, gyr_mdps=%ld,%ld,%ld", self_test.gyr_pass, (long)self_test.gyr_x_mdps,
+                    (long)self_test.gyr_y_mdps, (long)self_test.gyr_z_mdps);
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    if (strcmp(argv[1], "timestamp") == 0)
+    {
+        result = imu_read_timestamp(&timestamp);
+        qmi8658b_shell_print_result(shell, "timestamp", result);
+        if (result == IMU_SUCCESS)
+        {
+            shell_print(shell, "timestamp=%lu", (unsigned long)timestamp);
+        }
+        return (result == IMU_SUCCESS) ? 0 : -EIO;
+    }
+
+    shell_error(shell, "Unknown command: %s", argv[1]);
     return -EINVAL;
 }
-#endif /* FS_STORE_TEST_ENABLE */
+#endif /* QMI8658B_SHELL_TEST_ENABLE */
 
 /* 注册自定义命令到 Shell 子系统 */
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_app,
@@ -1633,25 +1035,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_app,
     SHELL_CMD(bleinfo, NULL, "Display BLE status", cmd_ble_info),
     SHELL_CMD(memstat, NULL, "Display memory statistics", cmd_mem_stat),
     SHELL_CMD(reboot, NULL, "Reboot system", cmd_reboot),
-    SHELL_CMD(switchmode, NULL, "Switch work mode", cmd_switch_mode),
-    SHELL_CMD(settime, NULL, "settime unix seconds ", cmd_set_time),
-    SHELL_CMD(gettime, NULL, "gettime unix seconds", cmd_get_time),
-    SHELL_CMD(modeset, NULL, "Configure longlife or smart mode parameters", cmd_modeset),
-    SHELL_CMD(AT_TEST, NULL, "Usage:app AT_TEST \"TEST xxxx(AT^GT_CM=xxxx)\"", shell_at_test),
-    SHELL_CMD(nfc_poll, NULL, "NFC polling: app nfc_poll <start|stop>", cmd_nfc_poll),
-    SHELL_CMD(shutdown, NULL, "Shutdown system (enter ultra-low power mode)", cmd_shutdown),
-    SHELL_CMD(blog, NULL, "Send BLE log test message: app blog <message>", cmd_ble_log_test),
-    SHELL_CMD(blogcfg, NULL, "BLE log config: app blogcfg <global|mod|level|show>", cmd_ble_log_config),
-    SHELL_CMD(ble_test, NULL, "test", cmd_ble_test),
-    SHELL_CMD(buzzer_test, NULL, "Run Buzzer test", cmd_buzzer_test),
-    SHELL_CMD(nfctrig_test, NULL, "Run nfctrig test", cmd_nfctrig_test),
-    SHELL_CMD(nfc_swip_test, NULL, "Run nfc swipe test", cmd_nfc_swip_test),
-    SHELL_CMD(tagscan, NULL, "Set tag scan config: app tagscan <mode> <scan_interval> <scan_length> <upload_interval>", cmd_tag_scan_set_config),
-    SHELL_CMD(alarmtest, NULL, "Test alarm message: app alarmtest <type> [info]", cmd_alarm_test),
-    SHELL_CMD(retransmit_check_test, NULL, "Run retransmit_check_test test", cmd_retransmit_check_test),
-    SHELL_CMD(hardware_test, NULL, "Run hardware test", cmd_hardware_test),
-#if FS_STORE_TEST_ENABLE
-    SHELL_CMD(fs, NULL, "Flash store test: app fs <init|info|count|push|fill|begin|read|commit|rewind|clear|sorttest>", cmd_fs_test),
+#if QMI8658B_SHELL_TEST_ENABLE
+    SHELL_CMD(qmi8658b, NULL, "QMI8658B test: qmi8658b <init|config|power|id|info|read|raw|temp|status|reg|int|fifo|motion|tap|feature|sync|offset|cali|gain|selftest|timestamp>", qmi8658b_shell_cmd),
 #endif
     SHELL_SUBCMD_SET_END
 );
@@ -1659,17 +1044,3 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_app,
  * 这个宏在头文件zephyr/shell/shell.h里定义，是Zephyr的Shell API的一部分
  */
 SHELL_CMD_REGISTER(app, &sub_app, "Application commands", NULL);
-
-/********************************************************************
-**函数名称:  my_shell_init
-**入口参数:  无
-**出口参数:  无
-**函数功能:  初始化 Shell 模块（Zephyr Shell 自动初始化，此处仅做日志输出）
-**返 回 值:  0 表示成功
-*********************************************************************/
-int my_shell_init(void)
-{
-    LOG_INF("Shell module initialized (RTT backend)");
-    LOG_INF("Use 'app sysinfo', 'app bleinfo', etc. to interact");
-    return 0;
-}
