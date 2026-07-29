@@ -1,7 +1,7 @@
 #include "my_comm.h"
 
-/* QMI8658B Shell测试开关：置1开启测试命令，量产前恢复为0 */
-#define QMI8658B_SHELL_TEST_ENABLE    1
+/* QMI8658B Shell测试开关：置1开启测试命令 */
+#define QMI8658B_SHELL_TEST_ENABLE    0
 
 #define LOG_MODULE_NAME my_shell
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
