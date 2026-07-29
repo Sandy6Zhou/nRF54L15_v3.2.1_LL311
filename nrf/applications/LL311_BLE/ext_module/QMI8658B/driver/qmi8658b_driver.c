@@ -17,10 +17,7 @@
 
 #define QMI8658B_FIFO_MAX_WORDS           1023U   /* 芯片 FIFO 最大计数，单位 16 位字 */
 #define QMI8658B_INT_SRC_FIFO_WATERMARK   0U      /* FIFO 水位中断源索引 */
-#define QMI8658B_INT_SRC_ANY_MOTION       1U      /* 任意运动中断源索引 */
-#define QMI8658B_INT_SRC_NO_MOTION        2U      /* 静止检测中断源索引 */
-#define QMI8658B_INT_SRC_SIG_MOTION       3U      /* 显著运动中断源索引 */
-#define QMI8658B_INT_SRC_TAP              4U      /* 敲击检测中断源索引 */
+#define QMI8658B_INT_SRC_ACTIVITY         1U      /* Any/No/Sig/Tap 共用活动检测中断索引 */
 #define QMI8658B_FEATURE_ANY_MOTION       0U      /* 任意运动特性索引 */
 #define QMI8658B_FEATURE_NO_MOTION        1U      /* 静止检测特性索引 */
 #define QMI8658B_FEATURE_SIG_MOTION       2U      /* 显著运动特性索引 */
@@ -547,6 +544,7 @@ int qmi8658b_driver_send_command(qmi8658b_driver_t *driver, uint8_t command)
 }
 
 /********************************************************************
+/********************************************************************
 **函数名称:  qmi8658b_driver_config_engine
 **入口参数:  driver      ---      驱动上下文（输入）
 **           config_set1 ---      第一组 CAL 参数（输入）
@@ -651,7 +649,7 @@ int qmi8658b_driver_enable_int_pin(qmi8658b_driver_t *driver, uint8_t pin, bool 
 **           source   ---        中断源索引（输入）
 **           pin      ---        目标引脚编号（输入）
 **出口参数:  无
-**函数功能:  映射 FIFO/运动/敲击中断源到 INT1 引脚
+**函数功能:  映射 FIFO 或全部活动检测事件到 INT1 引脚
 **返回值:    0 表示成功，负值表示失败
 *********************************************************************/
 int qmi8658b_driver_map_interrupt(qmi8658b_driver_t *driver, uint8_t source, uint8_t pin)
@@ -665,7 +663,7 @@ int qmi8658b_driver_map_interrupt(qmi8658b_driver_t *driver, uint8_t source, uin
         return -ENOTSUP;
     }
 
-    if (source > QMI8658B_INT_SRC_TAP)
+    if (source > QMI8658B_INT_SRC_ACTIVITY)
     {
         return -EINVAL;
     }

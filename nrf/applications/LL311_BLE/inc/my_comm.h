@@ -268,5 +268,6 @@ typedef enum
 
 /* ========== 集中引用所有模块头文件 ========== */
 #include "my_gsensor.h"
+#include "imu_api.h"
 
 #endif /* _MY_COMMON_H_ */

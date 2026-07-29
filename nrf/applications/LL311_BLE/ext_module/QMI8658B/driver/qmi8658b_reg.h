@@ -81,10 +81,10 @@
 #define QMI8658B_STATUS_INT_CMD_DONE      0x80U
 
 /* FIFO 配置 */
-#define QMI8658B_FIFO_SIZE_16             0x00U
-#define QMI8658B_FIFO_SIZE_32             0x04U
-#define QMI8658B_FIFO_SIZE_64             0x08U
-#define QMI8658B_FIFO_SIZE_128            0x0CU
+#define QMI8658B_FIFO_CTRL_SIZE_16        0x00U
+#define QMI8658B_FIFO_CTRL_SIZE_32        0x04U
+#define QMI8658B_FIFO_CTRL_SIZE_64        0x08U
+#define QMI8658B_FIFO_CTRL_SIZE_128       0x0CU
 
 /* FIFO_STATUS 位定义 (0x16) */
 #define QMI8658B_FIFO_STATUS_NOT_EMPTY    0x10U

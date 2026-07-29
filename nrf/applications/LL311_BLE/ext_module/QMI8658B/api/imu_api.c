@@ -724,7 +724,7 @@ imu_result_t imu_int_pin_enable(imu_int_pin_t pin, bool enable)
 **入口参数:  src      ---        中断源（输入）
 **           pin      ---        目标中断引脚（输入）
 **出口参数:  无
-**函数功能:  映射中断源到指定引脚
+**函数功能:  映射 FIFO 或活动检测中断到指定引脚
 **返回值:    IMU_SUCCESS 表示成功，其他表示错误码
 *********************************************************************/
 imu_result_t imu_int_map(imu_int_src_t src, imu_int_pin_t pin)
@@ -947,7 +947,7 @@ imu_result_t imu_set_motion_config(const imu_motion_config_t *config)
     config_set1[4] = config->no_motion_threshold_y;
     config_set1[5] = config->no_motion_threshold_z;
     config_set1[6] = config->mode_ctrl;  // MOTION_MODE_CTRL: 轴使能和逻辑配置
-    config_set1[7] = 0x01U;              // CAL4_H=0x01 标识第一组参数
+    config_set1[7] = 0x01U;              // CAL4_H=0x01，标识第一组参数
     // 第二组参数按数据手册 Table 35 顺序写入 CAL1~CAL4
     config_set2[0] = config->any_motion_window;
     config_set2[1] = config->no_motion_window;
@@ -956,7 +956,7 @@ imu_result_t imu_set_motion_config(const imu_motion_config_t *config)
     config_set2[4] = (uint8_t)(config->sig_motion_confirm_window & 0x00FFU);
     config_set2[5] = (uint8_t)((config->sig_motion_confirm_window >> 8) & 0x00FFU);
     config_set2[6] = 0U;                 // CAL4_L 第二组不用
-    config_set2[7] = 0x02U;              // CAL4_H=0x02 标识第二组参数
+    config_set2[7] = 0x02U;              // CAL4_H=0x02，标识第二组参数
 
     return imu_convert_result(qmi8658b_driver_set_motion_config(&s_driver, config_set1, config_set2));
 }
@@ -965,7 +965,7 @@ imu_result_t imu_set_motion_config(const imu_motion_config_t *config)
 **函数名称:  imu_set_tap_config
 **入口参数:  config   ---        敲击检测配置参数（输入）
 **出口参数:  无
-**函数功能:  按数据手册的两段 CTRL9 流程配置敲击检测
+**函数功能:  按数据手册的两段 CTRL9 流程配置敲击检测(目前敲击检测功能并没有生效,后续若需要使用再问原厂)
 **返回值:    IMU_SUCCESS 表示成功，其他表示错误码
 *********************************************************************/
 imu_result_t imu_set_tap_config(const imu_tap_config_t *config)
@@ -991,7 +991,7 @@ imu_result_t imu_set_tap_config(const imu_tap_config_t *config)
     config_set1[4] = (uint8_t)(config->double_tap_window & 0x00FFU);    // DTapWindow 低字节
     config_set1[5] = (uint8_t)((config->double_tap_window >> 8) & 0x00FFU); // DTapWindow 高字节
     config_set1[6] = 0U;                 // CAL4_L 第一组不用
-    config_set1[7] = 0x01U;              // CAL4_H=0x01 标识第一组参数
+    config_set1[7] = 0x01U;              // CAL4_H=0x01，标识第一组参数
     // 第二组参数按数据手册 Table 37 顺序写入 CAL1~CAL4
     config_set2[0] = config->alpha;
     config_set2[1] = config->gamma;
@@ -1000,7 +1000,7 @@ imu_result_t imu_set_tap_config(const imu_tap_config_t *config)
     config_set2[4] = (uint8_t)(config->undefined_motion_threshold & 0x00FFU);     // UDMThr 低字节
     config_set2[5] = (uint8_t)((config->undefined_motion_threshold >> 8) & 0x00FFU); // UDMThr 高字节
     config_set2[6] = 0U;                 // CAL4_L 第二组不用
-    config_set2[7] = 0x02U;              // CAL4_H=0x02 标识第二组参数
+    config_set2[7] = 0x02U;              // CAL4_H=0x02，标识第二组参数
 
     return imu_convert_result(qmi8658b_driver_set_tap_config(&s_driver, config_set1, config_set2));
 }

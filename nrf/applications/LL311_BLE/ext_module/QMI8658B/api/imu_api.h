@@ -96,11 +96,8 @@ typedef enum
 typedef enum
 {
     IMU_INT_SRC_FIFO_WATERMARK = 0, /* FIFO 水位到达阈值 */
-    IMU_INT_SRC_ANY_MOTION,         /* 任意运动检测 */
-    IMU_INT_SRC_NO_MOTION,          /* 静止检测 */
-    IMU_INT_SRC_SIG_MOTION,         /* 显著运动检测 */
-    IMU_INT_SRC_TAP,                /* 敲击检测 */
-    IMU_INT_SRC_MAX,                /* 中断源数量 */
+    IMU_INT_SRC_ACTIVITY,           /* Any/No/Sig/Tap 共用活动检测中断 */
+    IMU_INT_SRC_MAX,                /* 中断路由数量 */
 } imu_int_src_t;
 
 typedef enum

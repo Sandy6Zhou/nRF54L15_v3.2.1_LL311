@@ -1,5 +1,4 @@
 #include "my_comm.h"
-#include "imu_api.h"
 
 /* QMI8658B Shell测试开关：置1开启测试命令，量产前恢复为0 */
 #define QMI8658B_SHELL_TEST_ENABLE    1
@@ -117,22 +116,94 @@ static int cmd_set_time(const struct shell *sh, size_t argc, char **argv)
 
 #if QMI8658B_SHELL_TEST_ENABLE
 #define QMI8658B_TEST_FIFO_MAX_FRAMES     16U
+#define QMI8658B_TEST_MOTION_WATCH_COUNT  20U
+#define QMI8658B_TEST_MOTION_WATCH_MS     250U
+#define QMI8658B_TEST_TAP_CAPTURE_SAMPLES 500U
+#define QMI8658B_TEST_TAP_WAVE_SAMPLES    100U
 #define QMI8658B_TEST_SENSOR_ACC           0x01U
 #define QMI8658B_TEST_SENSOR_GYR           0x02U
 #define QMI8658B_TEST_REG_CTRL1            0x02U
 #define QMI8658B_TEST_REG_CTRL2            0x03U
 #define QMI8658B_TEST_REG_CTRL3            0x04U
 #define QMI8658B_TEST_REG_CTRL7            0x08U
+#define QMI8658B_TEST_REG_CTRL8            0x09U
+#define QMI8658B_TEST_REG_CTRL9            0x0AU
 #define QMI8658B_TEST_REG_CAL1_L           0x0BU
+#define QMI8658B_TEST_REG_STATUSINT        0x2DU
 #define QMI8658B_TEST_REG_FIFO_COUNT       0x15U
+#define QMI8658B_TEST_REG_STATUS0          0x2EU
+#define QMI8658B_TEST_REG_STATUS1          0x2FU
 #define QMI8658B_TEST_CTRL1_FIFO_INT1      0x04U
 #define QMI8658B_TEST_FIFO_STATUS_NOT_EMPTY 0x10U
 #define QMI8658B_TEST_FIFO_STATUS_WTM      0x40U
 
+typedef struct
+{
+    int32_t delta_x;
+    int32_t delta_y;
+    int32_t delta_z;
+    int32_t square_sum;
+} qmi8658b_tap_capture_sample_t;
+
 static imu_raw_data_t s_qmi8658b_fifo_frames[QMI8658B_TEST_FIFO_MAX_FRAMES];
+static imu_raw_data_t s_qmi8658b_fifo_discard_frames[QMI8658B_TEST_FIFO_MAX_FRAMES];
+static qmi8658b_tap_capture_sample_t s_qmi8658b_tap_capture_samples[QMI8658B_TEST_TAP_CAPTURE_SAMPLES];
 static volatile uint32_t s_qmi8658b_int_count;
 static uint8_t s_qmi8658b_gyro_gain[6];
 static bool s_qmi8658b_gyro_gain_valid;
+
+/********************************************************************
+**函数名称:  qmi8658b_shell_print_tap_config_diag
+**入口参数:  shell     ---        Shell实例指针（输入）
+**出口参数:  无
+**函数功能:  读取并输出Tap配置后的CAL和控制寄存器原始值
+**返回值:    IMU_SUCCESS表示成功，其他表示错误码
+*********************************************************************/
+static imu_result_t qmi8658b_shell_print_tap_config_diag(const struct shell *shell)
+{
+    uint8_t cal_data[8];
+    uint8_t ctrl7;
+    uint8_t ctrl8;
+    uint8_t ctrl9;
+    uint8_t statusint;
+    imu_result_t result;
+
+    result = imu_read_reg(QMI8658B_TEST_REG_CAL1_L, cal_data, sizeof(cal_data));
+    if (result != IMU_SUCCESS)
+    {
+        return result;
+    }
+
+    result = imu_read_reg(QMI8658B_TEST_REG_CTRL7, &ctrl7, 1U);
+    if (result != IMU_SUCCESS)
+    {
+        return result;
+    }
+
+    result = imu_read_reg(QMI8658B_TEST_REG_CTRL8, &ctrl8, 1U);
+    if (result != IMU_SUCCESS)
+    {
+        return result;
+    }
+
+    result = imu_read_reg(QMI8658B_TEST_REG_CTRL9, &ctrl9, 1U);
+    if (result != IMU_SUCCESS)
+    {
+        return result;
+    }
+
+    result = imu_read_reg(QMI8658B_TEST_REG_STATUSINT, &statusint, 1U);
+    if (result != IMU_SUCCESS)
+    {
+        return result;
+    }
+
+    shell_print(shell, "tap_diag: CAL=%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X", cal_data[0], cal_data[1],
+                cal_data[2], cal_data[3], cal_data[4], cal_data[5], cal_data[6], cal_data[7]);
+    shell_print(shell, "tap_diag: CTRL7=%02X CTRL8=%02X CTRL9=%02X STATUSINT=%02X", ctrl7, ctrl8, ctrl9, statusint);
+
+    return IMU_SUCCESS;
+}
 
 /********************************************************************
 **函数名称:  qmi8658b_shell_int_callback
@@ -236,7 +307,7 @@ static int qmi8658b_shell_parse_feature(const char *name, imu_feature_t *feature
 **函数名称:  qmi8658b_shell_parse_int_source
 **入口参数:  name   ---        中断源名称字符串（输入）
 **出口参数:  source ---        解析后的中断源
-**函数功能:  解析Shell输入的QMI8658B中断源名称
+**函数功能:  解析Shell输入的FIFO或活动中断路由名称
 **返回值:    0表示成功，-EINVAL表示参数无效
 *********************************************************************/
 static int qmi8658b_shell_parse_int_source(const char *name, imu_int_src_t *source)
@@ -250,21 +321,10 @@ static int qmi8658b_shell_parse_int_source(const char *name, imu_int_src_t *sour
     {
         *source = IMU_INT_SRC_FIFO_WATERMARK;
     }
-    else if (strcmp(name, "any") == 0)
+    else if (strcmp(name, "activity") == 0)
     {
-        *source = IMU_INT_SRC_ANY_MOTION;
-    }
-    else if (strcmp(name, "no") == 0)
-    {
-        *source = IMU_INT_SRC_NO_MOTION;
-    }
-    else if (strcmp(name, "sig") == 0)
-    {
-        *source = IMU_INT_SRC_SIG_MOTION;
-    }
-    else if (strcmp(name, "tap") == 0)
-    {
-        *source = IMU_INT_SRC_TAP;
+        // QMI8658B使用CTRL8.bit6统一路由Any/No/Sig/Tap活动事件至INT1
+        *source = IMU_INT_SRC_ACTIVITY;
     }
     else
     {
@@ -284,19 +344,35 @@ static int qmi8658b_shell_parse_int_source(const char *name, imu_int_src_t *sour
 static int qmi8658b_shell_config_motion(const struct shell *shell)
 {
     imu_motion_config_t config;
+    imu_config_t sensor_config;
     imu_result_t result;
+
+    memset(&sensor_config, 0, sizeof(sensor_config));
+    sensor_config.acc_range = IMU_ACC_RANGE_8G;
+    sensor_config.acc_odr = IMU_ODR_250HZ;
+    sensor_config.gyr_range = IMU_GYR_RANGE_1024DPS;
+    sensor_config.gyr_odr = IMU_ODR_250HZ;
+    sensor_config.power_mode = IMU_POWER_NORMAL;
+    sensor_config.lpf_enable = false;  // 运动检测依赖相邻采样斜率，关闭低通以保留快速动作
+    sensor_config.lpf_mode = IMU_LPF_MODE_0;
+    result = imu_set_config(&sensor_config);
+    qmi8658b_shell_print_result(shell, "motion_odr_config", result);
+    if (result != IMU_SUCCESS)
+    {
+        return -EIO;
+    }
 
     memset(&config, 0, sizeof(config));
     config.any_motion_threshold_x = 3U;
     config.any_motion_threshold_y = 3U;
     config.any_motion_threshold_z = 3U;
-    config.no_motion_threshold_x = 3U;
-    config.no_motion_threshold_y = 3U;
-    config.no_motion_threshold_z = 3U;
+    config.no_motion_threshold_x = 1U; // 0.03125g，轻微晃动即可退出静止状态
+    config.no_motion_threshold_y = 1U;
+    config.no_motion_threshold_z = 1U;
     config.any_motion_window = 1U;
-    config.no_motion_window = 10U;
+    config.no_motion_window = 255U; // 250Hz下约1秒，便于人工动作后观察静止状态变化
     config.sig_motion_wait_window = 100U;
-    config.sig_motion_confirm_window = 10U;
+    config.sig_motion_confirm_window = 50U; // 250Hz下200ms，便于人工完成第二次确认动作
     config.mode_ctrl = 0x77U;    // Any/No-Motion均使能三轴并使用OR逻辑
 
     result = imu_set_motion_config(&config);
@@ -323,7 +399,7 @@ static int qmi8658b_shell_config_tap(const struct shell *shell)
     sensor_config.gyr_range = IMU_GYR_RANGE_1024DPS;
     sensor_config.gyr_odr = IMU_ODR_250HZ;
     sensor_config.power_mode = IMU_POWER_NORMAL;
-    sensor_config.lpf_enable = true;
+    sensor_config.lpf_enable = false; // 敲击检测依赖瞬时冲击峰值，关闭低通以保留高频冲击信号
     sensor_config.lpf_mode = IMU_LPF_MODE_0;
     result = imu_set_config(&sensor_config);
     qmi8658b_shell_print_result(shell, "tap_odr_config", result);
@@ -333,17 +409,37 @@ static int qmi8658b_shell_config_tap(const struct shell *shell)
     }
 
     memset(&config, 0, sizeof(config));
-    config.peak_window = 10U;
-    config.priority = 0U;
-    config.tap_window = 32U;
-    config.double_tap_window = 64U;
-    config.alpha = 64U;
-    config.gamma = 64U;
-    config.peak_magnitude_threshold = 256U;
-    config.undefined_motion_threshold = 128U;
+    config.peak_window = 75U;             // 250Hz下：75个sample = 300ms
+    config.priority = 0U;                 // X > Y > Z 优先级
+    config.tap_window = 63U;              // 250Hz下：63个sample约252ms
+    config.double_tap_window = 250U;      // 250Hz下：250个sample = 1s
+    config.alpha = 8U;                    // Alpha=8 (数据手册示例值)
+    config.gamma = 32U;                   // Gamma=32 (数据手册示例值)
+    config.peak_magnitude_threshold = 800U;   // 800 × 0.001g² = 0.8g² (数据手册示例值)
+    config.undefined_motion_threshold = 400U; // 400 × 0.001g² = 0.4g² (数据手册示例值)
+
+    shell_print(shell, "tap_param: peak_win=%u tap_win=%u double_tap_win=%u peak_thr=%u udm_thr=%u",
+                (unsigned int)config.peak_window, (unsigned int)config.tap_window,
+                (unsigned int)config.double_tap_window, (unsigned int)config.peak_magnitude_threshold,
+                (unsigned int)config.undefined_motion_threshold);
 
     result = imu_set_tap_config(&config);
     qmi8658b_shell_print_result(shell, "tap_config", result);
+    if (result != IMU_SUCCESS)
+    {
+        return -EIO;
+    }
+
+    result = qmi8658b_shell_print_tap_config_diag(shell);
+    qmi8658b_shell_print_result(shell, "tap_config_diag", result);
+    if (result != IMU_SUCCESS)
+    {
+        return -EIO;
+    }
+
+    // 数据手册10.4节：配置完成后必须使能tap引擎（CTRL8.bit0 = 1）
+    result = imu_feature_enable(IMU_FEATURE_TAP, true);
+    qmi8658b_shell_print_result(shell, "tap_enable", result);
     return (result == IMU_SUCCESS) ? 0 : -EIO;
 }
 
@@ -379,17 +475,33 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
     int32_t temperature;
     int16_t offset[3];
     uint16_t frame_count;
+    uint16_t discard_frame_count;
+    int32_t capture_base_x;
+    int32_t capture_base_y;
+    int32_t capture_base_z;
+    int32_t capture_delta_x;
+    int32_t capture_delta_y;
+    int32_t capture_delta_z;
+    int32_t capture_max_sq;
+    int32_t capture_sq;
+    uint16_t capture_index;
+    uint16_t capture_peak_index;
+    uint16_t capture_wave_count;
     uint16_t fifo_words_before;
     uint16_t fifo_words_after;
     uint16_t index;
+    uint8_t drain_count;
     uint8_t sensor_mask;
+    uint8_t watch_count;
     bool enable;
+    bool capture_tap_detected;
     unsigned long count;
     char *end_ptr;
 
     if (argc < 2U)
     {
         shell_print(shell, "Usage: qmi8658b <init|config|power|id|info|read|raw|temp|status|reg|int|fifo|motion|tap|feature|sync|offset|cali|gain|selftest>");
+        shell_print(shell, "  reg: qmi8658b reg <ctrl1|ctrl7|ctrl8|status1>  ctrl1为读写回测，其余为原始值只读");
         return -EINVAL;
     }
 
@@ -467,12 +579,12 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
         {
             shell_print(shell, "CTRL2=0x%02X, CTRL3=0x%02X, CTRL7=0x%02X", reg_value, reg_verify, status);
             if ((strcmp(argv[2], "low") == 0) &&
-                ((reg_value != 0x2DU) || (reg_verify != 0x36U) || (status != QMI8658B_TEST_SENSOR_ACC)))
+                ((reg_value != 0x2DU) || (reg_verify != 0x66U) || (status != QMI8658B_TEST_SENSOR_ACC)))
             {
                 result = IMU_ERROR_COMM;
             }
             else if ((strcmp(argv[2], "normal") == 0) &&
-                     ((reg_value != 0x26U) || (reg_verify != 0x36U) ||
+                     ((reg_value != 0x26U) || (reg_verify != 0x66U) ||
                       (status != (QMI8658B_TEST_SENSOR_ACC | QMI8658B_TEST_SENSOR_GYR))))
             {
                 result = IMU_ERROR_COMM;
@@ -588,9 +700,83 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
 
     if (strcmp(argv[1], "reg") == 0)
     {
-        if ((argc != 3U) || (strcmp(argv[2], "ctrl1") != 0))
+        if (argc != 3U)
         {
-            shell_error(shell, "Usage: qmi8658b reg ctrl1");
+            shell_error(shell, "Usage: qmi8658b reg <ctrl1|ctrl7|ctrl8|status1>");
+            return -EINVAL;
+        }
+
+        // 诊断用途：直接读取CTRL7/CTRL8/STATUS1原始值，无读写回测逻辑
+        if (strcmp(argv[2], "ctrl2") == 0)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_CTRL2, &reg_value, 1U);
+            qmi8658b_shell_print_result(shell, "reg_ctrl2", result);
+            if (result == IMU_SUCCESS)
+            {
+                uint8_t aodr = reg_value & 0x0FU;
+                uint8_t ascale = (reg_value >> 4) & 0x07U;
+                const char *odr_str = "UNKNOWN";
+
+                // 根据数据手册Table 23的ODR编码
+                switch (aodr)
+                {
+                    case 0x03: odr_str = "1000Hz"; break;
+                    case 0x04: odr_str = "500Hz"; break;
+                    case 0x05: odr_str = "250Hz"; break;
+                    case 0x06: odr_str = "125Hz"; break;
+                    case 0x07: odr_str = "62.5Hz"; break;
+                    case 0x08: odr_str = "31.25Hz"; break;
+                    default: odr_str = "OTHER"; break;
+                }
+
+                shell_print(shell, "CTRL2=0x%02X (aODR=%u aScale=%u)", reg_value, aodr, ascale);
+                shell_print(shell, "  aODR=0x%02X -> %s", aodr, odr_str);
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "ctrl7") == 0)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_CTRL7, &reg_value, 1U);
+            qmi8658b_shell_print_result(shell, "reg_ctrl7", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "CTRL7=0x%02X (aEN=%u gEN=%u gSN=%u DRDY_DIS=%u syncSmpl=%u)", reg_value,
+                            reg_value & 0x01U, (reg_value >> 1) & 0x01U, (reg_value >> 4) & 0x01U,
+                            (reg_value >> 5) & 0x01U, (reg_value >> 7) & 0x01U);
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "ctrl8") == 0)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_CTRL8, &reg_value, 1U);
+            qmi8658b_shell_print_result(shell, "reg_ctrl8", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "CTRL8=0x%02X (tap_en=%u any_en=%u no_en=%u sig_en=%u int_sel=%u handshake=%u)",
+                            reg_value, reg_value & 0x01U, (reg_value >> 1) & 0x01U, (reg_value >> 2) & 0x01U,
+                            (reg_value >> 3) & 0x01U, (reg_value >> 6) & 0x01U, (reg_value >> 7) & 0x01U);
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "status1") == 0)
+        {
+            result = imu_read_reg(QMI8658B_TEST_REG_STATUS1, &reg_value, 1U);
+            qmi8658b_shell_print_result(shell, "reg_status1", result);
+            if (result == IMU_SUCCESS)
+            {
+                shell_print(shell, "STATUS1=0x%02X (sig=%u no=%u any=%u tap=%u)", reg_value,
+                            (reg_value >> 7) & 0x01U, (reg_value >> 6) & 0x01U, (reg_value >> 5) & 0x01U,
+                            (reg_value >> 1) & 0x01U);
+            }
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        if (strcmp(argv[2], "ctrl1") != 0)
+        {
+            shell_error(shell, "Usage: qmi8658b reg <ctrl1|ctrl2|ctrl7|ctrl8|status1>");
             return -EINVAL;
         }
 
@@ -689,7 +875,7 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
         {
             if (qmi8658b_shell_parse_int_source(argv[3], &int_source) != 0)
             {
-                shell_error(shell, "Usage: qmi8658b int map <fifo|any|no|sig|tap>");
+                shell_error(shell, "Usage: qmi8658b int map <fifo|activity>");
                 return -EINVAL;
             }
 
@@ -741,6 +927,24 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
             if ((result == IMU_SUCCESS) && (frame_count == 0U))
             {
                 result = IMU_ERROR_COMM;
+            }
+            // FIFO 满载时首批仅打印16帧，继续丢弃至水印以下以释放INT1电平
+            for (drain_count = 0U; (result == IMU_SUCCESS) && (drain_count < 7U); drain_count++)
+            {
+                result = imu_fifo_get_status(&status);
+                if ((result == IMU_SUCCESS) && ((status & QMI8658B_TEST_FIFO_STATUS_WTM) != 0U))
+                {
+                    result = imu_fifo_read(s_qmi8658b_fifo_discard_frames, QMI8658B_TEST_FIFO_MAX_FRAMES,
+                                           &discard_frame_count);
+                    if ((result == IMU_SUCCESS) && (discard_frame_count == 0U))
+                    {
+                        result = IMU_ERROR_COMM;
+                    }
+                }
+                else
+                {
+                    break;
+                }
             }
             qmi8658b_shell_print_result(shell, "fifo_read", result);
             if (result == IMU_SUCCESS)
@@ -827,7 +1031,7 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
     {
         if (argc != 3U)
         {
-            shell_error(shell, "Usage: qmi8658b motion <config|status> or qmi8658b tap <config|status>");
+            shell_error(shell, "Usage: qmi8658b motion <config|status|watch> or qmi8658b tap <config|status>");
             return -EINVAL;
         }
 
@@ -848,6 +1052,26 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
             return (result == IMU_SUCCESS) ? 0 : -EIO;
         }
 
+        if ((strcmp(argv[1], "motion") == 0) && (strcmp(argv[2], "watch") == 0))
+        {
+            for (watch_count = 0U; watch_count < QMI8658B_TEST_MOTION_WATCH_COUNT; watch_count++)
+            {
+                result = imu_get_motion_status(&motion_status);
+                if (result != IMU_SUCCESS)
+                {
+                    qmi8658b_shell_print_result(shell, "motion_watch", result);
+                    return -EIO;
+                }
+
+                shell_print(shell, "[%u] any=%u no=%u sig=%u tap=%u", watch_count, motion_status.any_motion,
+                            motion_status.no_motion, motion_status.sig_motion, motion_status.tap);
+                k_msleep(QMI8658B_TEST_MOTION_WATCH_MS);
+            }
+
+            qmi8658b_shell_print_result(shell, "motion_watch", IMU_SUCCESS);
+            return 0;
+        }
+
         if ((strcmp(argv[1], "tap") == 0) && (strcmp(argv[2], "status") == 0))
         {
             result = imu_get_tap_status(&tap_status);
@@ -860,7 +1084,107 @@ static int qmi8658b_shell_cmd(const struct shell *shell, size_t argc, char **arg
             return (result == IMU_SUCCESS) ? 0 : -EIO;
         }
 
-        shell_error(shell, "Usage: qmi8658b motion <config|status> or qmi8658b tap <config|status>");
+        if ((strcmp(argv[1], "tap") == 0) && (strcmp(argv[2], "capture") == 0))
+        {
+            result = imu_read(&data);
+            if (result != IMU_SUCCESS)
+            {
+                qmi8658b_shell_print_result(shell, "tap_capture", result);
+                return -EIO;
+            }
+
+            // 以首帧数据为静止基准，后续持续采样中的最大偏移即为敲击冲击峰值
+            capture_base_x = data.acc_x;
+            capture_base_y = data.acc_y;
+            capture_base_z = data.acc_z;
+            capture_max_sq = 0;
+            capture_peak_index = 0U;
+            capture_tap_detected = false;
+
+            shell_print(shell, "capturing... please tap now");
+            for (capture_index = 0U; capture_index < QMI8658B_TEST_TAP_CAPTURE_SAMPLES; capture_index++)
+            {
+                result = imu_read(&data);
+                if (result != IMU_SUCCESS)
+                {
+                    break;
+                }
+
+                capture_delta_x = data.acc_x - capture_base_x;
+                capture_delta_y = data.acc_y - capture_base_y;
+                capture_delta_z = data.acc_z - capture_base_z;
+                capture_sq = capture_delta_x * capture_delta_x + capture_delta_y * capture_delta_y +
+                             capture_delta_z * capture_delta_z;
+                s_qmi8658b_tap_capture_samples[capture_index].delta_x = capture_delta_x;
+                s_qmi8658b_tap_capture_samples[capture_index].delta_y = capture_delta_y;
+                s_qmi8658b_tap_capture_samples[capture_index].delta_z = capture_delta_z;
+                s_qmi8658b_tap_capture_samples[capture_index].square_sum = capture_sq;
+                if (capture_sq > capture_max_sq)
+                {
+                    capture_max_sq = capture_sq;
+                    capture_peak_index = capture_index;
+                }
+
+                if (!capture_tap_detected)
+                {
+                    result = imu_get_motion_status(&motion_status);
+                    if (result != IMU_SUCCESS)
+                    {
+                        break;
+                    }
+
+                    if (motion_status.tap)
+                    {
+                        result = imu_get_tap_status(&tap_status);
+                        if (result != IMU_SUCCESS)
+                        {
+                            break;
+                        }
+
+                        capture_tap_detected = true;
+                        shell_print(shell, "tap_event: sample=%u number=%u axis=%u negative=%u", capture_index,
+                                    tap_status.tap_number, tap_status.axis, tap_status.negative_polarity);
+                    }
+                }
+            }
+
+            qmi8658b_shell_print_result(shell, "tap_capture", result);
+            if (result == IMU_SUCCESS)
+            {
+                // capture_max_sq 单位为 mg^2；阈值寄存器单位为 1/1024 g^2，1g^2=1e6 mg^2
+                // 等效阈值单位 = capture_max_sq(mg^2) / 1e6(mg^2 per g^2) * 1024(unit per g^2)
+                shell_print(shell, "baseline_mg=%ld,%ld,%ld", (long)capture_base_x, (long)capture_base_y,
+                            (long)capture_base_z);
+                shell_print(shell, "max_peak_sq_mg2=%ld", (long)capture_max_sq);
+                shell_print(shell, "equivalent_threshold_unit=%ld (compare with config peak_magnitude_threshold)",
+                            (long)(capture_max_sq * 1024L / 1000000L));
+                capture_wave_count = QMI8658B_TEST_TAP_CAPTURE_SAMPLES - capture_peak_index;
+                if (capture_wave_count > QMI8658B_TEST_TAP_WAVE_SAMPLES)
+                {
+                    capture_wave_count = QMI8658B_TEST_TAP_WAVE_SAMPLES;
+                }
+
+                shell_print(shell, "tap_wave: peak_index=%u sample_count=%u", capture_peak_index, capture_wave_count);
+                for (index = 0U; index < capture_wave_count; index++)
+                {
+                    capture_index = capture_peak_index + index;
+                    shell_print(shell, "tap_wave[%u] delta_mg=%ld,%ld,%ld sq_mg2=%ld", index,
+                                (long)s_qmi8658b_tap_capture_samples[capture_index].delta_x,
+                                (long)s_qmi8658b_tap_capture_samples[capture_index].delta_y,
+                                (long)s_qmi8658b_tap_capture_samples[capture_index].delta_z,
+                                (long)s_qmi8658b_tap_capture_samples[capture_index].square_sum);
+                }
+
+                if (!capture_tap_detected)
+                {
+                    shell_print(shell, "tap_event: not_detected_during_capture");
+                }
+            }
+
+            return (result == IMU_SUCCESS) ? 0 : -EIO;
+        }
+
+        shell_error(shell, "Usage: qmi8658b motion <config|status|watch> or qmi8658b tap <config|status|capture>");
         return -EINVAL;
     }
 
@@ -1035,6 +1359,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_app,
     SHELL_CMD(bleinfo, NULL, "Display BLE status", cmd_ble_info),
     SHELL_CMD(memstat, NULL, "Display memory statistics", cmd_mem_stat),
     SHELL_CMD(reboot, NULL, "Reboot system", cmd_reboot),
+    SHELL_CMD(settime, NULL, "settime unix seconds ", cmd_set_time),
 #if QMI8658B_SHELL_TEST_ENABLE
     SHELL_CMD(qmi8658b, NULL, "QMI8658B test: qmi8658b <init|config|power|id|info|read|raw|temp|status|reg|int|fifo|motion|tap|feature|sync|offset|cali|gain|selftest|timestamp>", qmi8658b_shell_cmd),
 #endif

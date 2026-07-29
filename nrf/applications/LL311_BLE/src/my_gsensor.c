@@ -1,5 +1,4 @@
 #include "my_comm.h"
-#include "imu_api.h"
 
 /* 注册 G-Sensor 模块日志 */
 LOG_MODULE_REGISTER(my_gsensor, LOG_LEVEL_INF);
@@ -75,9 +74,10 @@ static void my_gsensor_task(void *p1, void *p2, void *p3)
         LOG_ERR("QMI8658B initialization failed (err %d)", imu_result);
         return;
     }
-
+#if 1
+    // 5s后循环按照5s间隔采集数据
     k_timer_start(&s_gsensor_sample_timer, K_MSEC(5000), K_MSEC(5000));
-
+#endif
     for (;;)
     {
         k_msgq_get(&my_gsensor_msgq, &msg, K_FOREVER);

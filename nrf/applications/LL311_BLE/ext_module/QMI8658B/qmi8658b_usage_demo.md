@@ -6,8 +6,6 @@
 
 公开头文件：`#include "imu_api.h"`
 
-数据手册：`QMI8658B/QMI8658B-Datasheet.pdf`
-
 ## 一、模块结构
 
 ```
@@ -22,7 +20,6 @@ QMI8658B/
 ├── port/
 │   ├── qmi8658b_port.h        Zephyr I2C 和 INT1 适配层
 │   └── qmi8658b_port.c
-├── qmi8658b_shell_test.md     Shell 测试用例
 └── qmi8658b_usage_demo.md     本文档
 ```
 
@@ -52,6 +49,7 @@ QMI8658B/
 | `imu_fifo_config_t` | FIFO 数据源、模式、深度、水印与中断引脚配置 |
 | `imu_motion_config_t` | Any-Motion、No-Motion、Sig-Motion 参数 |
 | `imu_tap_config_t` | 单击和双击检测参数 |
+| `imu_int_src_t` | `IMU_INT_SRC_FIFO_WATERMARK` 或 `IMU_INT_SRC_ACTIVITY` 中断路由 |
 | `imu_chip_info_t` | 固件版本与六字节 USID |
 | `imu_self_test_result_t` | 加速度计和陀螺仪自检结果及差分数据 |
 
@@ -147,7 +145,7 @@ static void app_imu_set_power_mode(void)
 
 `imu_read_reg` 和 `imu_write_reg` 用于调试或数据手册定义的高级配置。业务代码不应随意改写 CTRL1、CTRL7、CTRL8、CTRL9、FIFO 和 CAL 寄存器，否则会破坏 API 层维护的配置状态。读写寄存器时应严格使用数据手册定义的地址、长度和时序。
 
-当前模块只支持 INT1：`imu_int_pin_enable` 的引脚参数必须为 `IMU_INT_PIN1`，`imu_int_map` 的目标也必须为 `IMU_INT_PIN1`。可映射中断源包括 `IMU_INT_SRC_FIFO_WATERMARK`、`IMU_INT_SRC_ANY_MOTION`、`IMU_INT_SRC_NO_MOTION`、`IMU_INT_SRC_SIG_MOTION` 和 `IMU_INT_SRC_TAP`。`imu_register_int_callback` 的回调在 GPIO 中断上下文运行，只能执行置位标志、计数或提交 work 等轻量操作，不能直接进行 I2C 读写、打印或长时间阻塞。
+当前模块只支持 INT1：`imu_int_pin_enable` 的引脚参数必须为 `IMU_INT_PIN1`，`imu_int_map` 的目标也必须为 `IMU_INT_PIN1`。`IMU_INT_SRC_FIFO_WATERMARK` 独立映射 FIFO 水位中断；`IMU_INT_SRC_ACTIVITY` 统一映射 Any-Motion、No-Motion、Sig-Motion 和 Tap，四类活动事件不能独立映射，实际事件类型需由 `STATUS1` 判断。`imu_register_int_callback` 的回调在 GPIO 中断上下文运行，只能执行置位标志、计数或提交 work 等轻量操作，不能直接进行 I2C 读写、打印或长时间阻塞。
 
 ```c
 static volatile bool s_imu_int_pending;
@@ -181,7 +179,32 @@ static void app_imu_enable_fifo_interrupt(void)
 }
 ```
 
-收到回调后，应在普通线程上下文调用 `imu_read_int_status`、`imu_fifo_get_status` 或对应事件状态接口确认来源并处理数据。当前 API 不支持把源映射到 `IMU_INT_NONE` 解除路由；需要停止中断输出时调用 `imu_int_pin_enable(IMU_INT_PIN1, false)`。
+```c
+static void app_imu_enable_activity_interrupt(void)
+{
+    imu_result_t result;
+
+    result = imu_register_int_callback(app_imu_int_callback);
+    if (result != IMU_SUCCESS)
+    {
+        return;
+    }
+
+    result = imu_int_pin_enable(IMU_INT_PIN1, true);
+    if (result != IMU_SUCCESS)
+    {
+        return;
+    }
+
+    result = imu_int_map(IMU_INT_SRC_ACTIVITY, IMU_INT_PIN1);
+    if (result != IMU_SUCCESS)
+    {
+        return;
+    }
+}
+```
+
+收到回调后，应在普通线程上下文调用 `imu_read_int_status`、`imu_fifo_get_status` 或对应事件状态接口确认来源并处理数据。活动中断应使用 `imu_get_motion_status` 判断 Any/No/Sig 状态，Tap 事件再使用 `imu_get_tap_status` 读取次数、轴和极性。当前 API 不支持把源映射到 `IMU_INT_NONE` 解除路由；需要停止中断输出时调用 `imu_int_pin_enable(IMU_INT_PIN1, false)`。
 
 ## 八、FIFO 使用示例
 
@@ -256,7 +279,14 @@ static void app_imu_enable_any_motion(void)
 
 ## 十、偏置、校准和硬件自检
 
-`imu_set_acc_offset` 使用 signed 4.12 格式写入三轴加速度主机偏置，`imu_set_gyr_offset` 使用 signed 11.5 格式写入三轴陀螺仪主机偏置。两个接口都会通过内部 CTRL9 命令应用设置；应用层应保存经标定得到的参数，不能把工程单位 mg/mdps 直接作为偏置寄存器数值传入。
+`imu_set_acc_offset` 和 `imu_set_gyr_offset` 的参数不是直接使用 mg 或 mdps，而是芯片规定的 16 位有符号偏置数值。换算方法如下：
+
+| 接口 | 传入值表示的物理量 | 换算方法 | 示例 |
+|---|---|---|---|
+| `imu_set_acc_offset` | 加速度偏置，单位 g | 传入值 = 偏置值(g) × 4096 | `4096` 表示 `+1 g`，`-205` 约表示 `-0.05 g`（约 `-50 mg`） |
+| `imu_set_gyr_offset` | 陀螺仪偏置，单位 dps | 传入值 = 偏置值(dps) × 32 | `32` 表示 `+1 dps`，`-160` 表示 `-5 dps` |
+
+原始资料中的 `signed 4.12` 和 `signed 11.5` 分别表示“小数点后保留 12 位”和“小数点后保留 5 位”的有符号定点数格式。两个接口都会通过内部 CTRL9 命令应用设置；偏置在传感器断电或复位后失效。应用层应保存经过换算和标定得到的参数，不能把采样输出的 mg/mdps 数值直接传入。
 
 `imu_run_calibration` 会执行片内 COD 校准并输出六字节陀螺仪增益。执行时必须保持传感器静止；需要持久化时由业务层保存输出值，并在合适时机使用 `imu_apply_gyro_gain` 恢复。
 

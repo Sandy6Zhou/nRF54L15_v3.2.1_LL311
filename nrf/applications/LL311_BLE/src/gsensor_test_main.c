@@ -1,5 +1,4 @@
 #include "my_comm.h"
-#include "imu_api.h"
 
 LOG_MODULE_REGISTER(gsensor_test_main, LOG_LEVEL_INF);
 
@@ -19,7 +18,7 @@ int my_set_system_time(time_t _sec)
 
     if (_sec < 1770000000)
     {
-        MY_LOG_INF("set system time failed, _sec=%ld", _sec);
+        LOG_INF("set system time failed, _sec=%ld", _sec);
         return -1;
     }
 
@@ -29,7 +28,7 @@ int my_set_system_time(time_t _sec)
     ret = sys_clock_settime(SYS_CLOCK_REALTIME, &ts);
     if (ret < 0)
     {
-        MY_LOG_INF("sys_clock_settime failed, ret=%d", ret);
+        LOG_INF("sys_clock_settime failed, ret=%d", ret);
         return ret;
     }
 

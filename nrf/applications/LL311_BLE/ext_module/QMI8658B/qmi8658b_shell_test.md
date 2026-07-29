@@ -31,7 +31,7 @@
 | `app qmi8658b timestamp` | 读取 24 位传感器时间戳 | 已初始化 |
 | `app qmi8658b reg ctrl1` | 翻转 FIFO_INT1 位、读回校验并恢复 CTRL1 | 已初始化 |
 | `app qmi8658b int callback` | 注册 INT1 GPIO 回调并清零计数 | 已初始化 |
-| `app qmi8658b int map <fifo\|any\|no\|sig\|tap>` | 将中断源映射至 INT1 | 已初始化 |
+| `app qmi8658b int map <fifo\|activity>` | 将 FIFO 或全部活动检测事件映射至 INT1 | 已初始化 |
 | `app qmi8658b int pin <on\|off>` | 使能或禁用芯片 INT1 输出 | 已初始化 |
 | `app qmi8658b int status` / `int count` / `int clear` | 读取 STATUSINT、读取或清零 GPIO 回调计数 | 已初始化 |
 | `app qmi8658b fifo start` | 配置 128 样本、六轴 Stream FIFO，水印为 32 | 已初始化 |
@@ -41,6 +41,7 @@
 | `app qmi8658b fifo flush_read` | 原子清空 FIFO 后立即读取帧数 | FIFO 已配置 |
 | `app qmi8658b motion config` | 写入运动检测测试参数 | 已初始化 |
 | `app qmi8658b motion status` | 读取 Any/No/Sig-Motion 与 Tap 状态 | 已初始化 |
+| `app qmi8658b motion watch` | 持续 5 秒输出 Any/No/Sig-Motion 与 Tap 状态 | 已初始化 |
 | `app qmi8658b tap config` | 写入敲击检测测试参数 | 已初始化 |
 | `app qmi8658b tap status` | 读取敲击次数、轴和方向 | 已初始化 |
 | `app qmi8658b feature <any\|no\|sig\|tap> <on\|off>` | 开关嵌入式检测特性 | 先写入对应配置 |
@@ -72,15 +73,15 @@
 |---|---|---|
 | TC-08 | 依次执行 `app qmi8658b init`、`app qmi8658b fifo start` | 两条命令均必须分别打印 `QMI8658B init: PASS` 与 `QMI8658B fifo_start: PASS`；FIFO 以六轴 Stream 模式、水印 32 工作。 |
 | TC-09 | 等待约 0.5 秒，执行 `app qmi8658b fifo status` | 必须打印 `QMI8658B fifo_status: PASS` 和 `FIFO_STATUS=0xXX`；命令仅在非空位或水印位置位时通过，证明 FIFO 已开始采样。 |
-| TC-10 | 执行 `app qmi8658b fifo read` | 必须打印非零的 `fifo_words_before=<N>`、`QMI8658B fifo_read: PASS` 和 `fifo_frames=<N>`，其中帧数应为 1 至 16；随后应有 N 行 `acc=... gyr=...` 数据。 |
+| TC-10 | 执行 `app qmi8658b fifo read` | 必须打印非零的 `fifo_words_before=<N>`、`QMI8658B fifo_read: PASS` 和 `fifo_frames=<N>`，其中帧数应为 1 至 16；随后应有 N 行 `acc=... gyr=...` 数据。命令仅打印首批 16 帧，并在水印仍有效时继续丢弃后续帧至水印以下，使 INT1 下降并可在下一个水印周期产生新的上升沿。 |
 | TC-11 | 在完成 TC-09 或 TC-10 后执行 `app qmi8658b fifo flush_read` | 必须打印 `fifo_words_before_flush=<N>` 且 N 大于 0、`QMI8658B fifo_flush: PASS`、`fifo_words_after_flush=<N>`、`QMI8658B fifo_read_after_flush: PASS`。125Hz 连续采样下，清空后最多允许新进入一个六轴样本，即 after 不大于 6 个字，读取帧数不大于 1。 |
 
 ## 5. 运动与敲击特性测试
 
 | 编号 | 操作步骤 | 预期结果 |
 |---|---|---|
-| TC-12 | 依次执行 `app qmi8658b init`、`app qmi8658b motion config`、`app qmi8658b feature any on` | 必须依次打印 `init: PASS`、`motion_config: PASS`、`feature: PASS`。测试配置使用三轴 OR 逻辑和 1 样本窗口，便于验证任意运动。 |
-| TC-13 | 在模块上做明显的快速移动，立即执行 `app qmi8658b motion status` | 必须打印 `QMI8658B motion_status: PASS` 和 `any=<0或1> no=<0或1> sig=<0或1> tap=<0或1>`。此用例仅验证状态寄存器读取；`any=0` 不能作为运动功能通过，实际触发判定必须执行 TC-31。 |
+| TC-12 | 依次执行 `app qmi8658b init`、`app qmi8658b motion config`、`app qmi8658b feature any on` | 必须依次打印 `init: PASS`、`motion_odr_config: PASS`、`motion_config: PASS`、`feature: PASS`。运动测试切换至 250Hz 且关闭低通滤波，并使用三轴 OR 逻辑和 1 样本窗口，便于验证任意运动；No-Motion 三轴阈值为 0.03125g，便于验证轻微晃动退出静止状态。 |
+| TC-13 | 执行 `app qmi8658b motion watch` 后，在 5 秒内做明显快速移动 | 必须打印 20 行状态和 `QMI8658B motion_watch: PASS`。启用 Any-Motion 时，动作期间应至少一行 `any=1`；`any=0` 不能作为运动功能通过，实际中断触发判定必须执行 TC-31。No-Motion 窗口为 255 个采样点（约 1 秒），动作停止约 1 秒后才允许重新出现 `no=1`。 |
 | TC-14 | 执行 `app qmi8658b feature any off` | 必须打印 `QMI8658B feature: PASS`。后续执行 `motion status` 时仍可成功读取，但不应因新的动作稳定出现 `any=1`。 |
 | TC-15 | 先执行 `app qmi8658b feature any on` 与 `app qmi8658b feature no on`，再执行 `app qmi8658b feature sig on` | 三条均必须打印 `QMI8658B feature: PASS`。未启用 Any 与 No 时直接执行 `sig on`，预期打印 `QMI8658B feature: FAIL, ret=4`。 |
 | TC-16 | 依次执行 `app qmi8658b tap config`、`app qmi8658b feature tap on` | `tap config` 必须先打印 `QMI8658B tap_odr_config: PASS`，表示已切换至 250Hz 采样；随后打印 `QMI8658B tap_config: PASS`，使能命令打印 `QMI8658B feature: PASS`。 |
@@ -100,7 +101,7 @@
 | 编号 | 操作步骤 | 预期结果与通过判定 |
 |---|---|---|
 | TC-22 | 执行 `app qmi8658b config normal`，再执行 `app qmi8658b read 1` | 第一条必须打印 `QMI8658B set_config: PASS`；第二条必须打印一行 `[0]` 数据和 `QMI8658B read: PASS`。 |
-| TC-23 | 执行 `app qmi8658b config low` | 必须打印 `CTRL2=0x2D, CTRL3=0x36, CTRL7=0x01` 和 `QMI8658B set_config: PASS`，表示 8g/21Hz LP 加速度配置、预置陀螺仪 ODR 与仅加速度使能均已读回确认。该用例不替代外部电流测量。 |
+| TC-23 | 执行 `app qmi8658b config low` | 必须打印 `CTRL2=0x2D, CTRL3=0x66, CTRL7=0x01` 和 `QMI8658B set_config: PASS`，表示 8g/21Hz LP 加速度配置、预置 1024dps/125Hz 陀螺仪配置与仅加速度使能均已读回确认。该用例不替代外部电流测量。 |
 | TC-24 | 在 TC-23 后依次执行 `app qmi8658b power normal`、`app qmi8658b config normal`、`app qmi8658b power snooze`、`app qmi8658b power suspend`、`app qmi8658b power normal` | `power normal` 在低功耗配置下应打印 `FAIL, ret=4`，这是预期的参数保护；其余命令在正确顺序下均必须打印 `QMI8658B power: PASS`。最终执行 `read 1` 必须成功，证明已恢复。 |
 | TC-25 | 执行 `app qmi8658b reg ctrl1` | 必须打印 `QMI8658B reg_read_write: PASS` 及 `CTRL1=0xXX, test=0xXX, verify=0xXX`，其中 test 与 verify 必须相等，且与 CTRL1 的 FIFO_INT1 位相反。命令完成后自动恢复 CTRL1 原值。 |
 | TC-26 | 执行 `app qmi8658b offset delta_zero`，再执行 `app qmi8658b read 1` | 必须打印 `QMI8658B offset_delta_zero: PASS`；随后读取必须打印 `QMI8658B read: PASS`。该命令提交零增量，不会消除先前通过 Delta Offset 累积的偏置。 |
@@ -115,10 +116,11 @@
 | TC-28 | 依次执行 `app qmi8658b init`、`app qmi8658b int callback`、`app qmi8658b int pin on` | 三条命令必须分别打印 `QMI8658B init: PASS`、`QMI8658B int_callback: PASS`、`QMI8658B int_pin: PASS`。`callback` 同时将计数清零。 |
 | TC-29 | 执行 `app qmi8658b int map fifo`、`app qmi8658b int clear`、`app qmi8658b fifo start`，等待 0.5 秒，执行 `app qmi8658b int count`、`app qmi8658b fifo status`，再读取 FIFO 至低于水印并等待回填后再次读取 `int count` | 清零后首次 `int_count` 应为 1 或更大，`FIFO_STATUS` 应显示水印或非空状态。读 FIFO 至低于水印、等待回填后，第二次计数必须比第一次增加，证明 GPIO 能对两个独立水印周期响应。 |
 | TC-30 | 执行 `app qmi8658b int pin off`，记录 `int count`；读取 FIFO 至低于水印，等待回填后再次执行 `int count` | `int_pin` 必须打印 `PASS`；关闭后的第二个计数必须与关闭前相同。该步骤必须产生新的水印周期，才能证明 INT1 输出关闭有效。 |
-| TC-31 | 依次执行 `app qmi8658b init`、`app qmi8658b int callback`、`app qmi8658b int pin on`、`app qmi8658b motion config`、`app qmi8658b feature any on`、`app qmi8658b int map any`、`app qmi8658b int clear`；快速移动模块后读取 `int count` 与 `motion status` | 前置初始化会清除 FIFO 路由，所有配置命令必须打印 `PASS`；清零后的 `int_count` 必须大于 0，且 `motion_status` 必须打印 `PASS`。若状态位因读取时序已清除，可重复动作并立即读取；计数增长仍是中断到达的通过依据。 |
-| TC-32 | 依次执行 `app qmi8658b init`、`app qmi8658b int callback`、`app qmi8658b int pin on`、`app qmi8658b tap config`、`app qmi8658b feature tap on`、`app qmi8658b int map tap`、`app qmi8658b int clear`；敲击模块后读取 `int count` 与 `tap status` | 前置初始化会清除 FIFO 路由，配置命令均必须打印 `PASS`；清零后的 `int_count` 必须大于 0。检测成功时 `tap_status` 打印 `number=1` 或 `number=2`、`axis=1/2/3`。由于机械结构影响，事件状态可能需要多次敲击确认，但 INT 计数增长是必须条件。 |
+| TC-31 | 依次执行 `app qmi8658b init`、`app qmi8658b int callback`、`app qmi8658b int pin on`、`app qmi8658b motion config`、`app qmi8658b feature any on`、`app qmi8658b int map activity`、`app qmi8658b int clear`；快速移动模块后读取 `int count` 与 `motion status` | 前置初始化会清除 FIFO 路由，所有配置命令必须打印 `PASS`；清零后的 `int_count` 必须大于 0，且 `motion_status` 必须打印 `PASS`。若状态位因读取时序已清除，可重复动作并立即读取；计数增长仍是中断到达的通过依据。 |
+| TC-32 | 依次执行 `app qmi8658b init`、`app qmi8658b int callback`、`app qmi8658b int pin on`、`app qmi8658b tap config`、`app qmi8658b feature tap on`、`app qmi8658b int map activity`、`app qmi8658b int clear`；敲击模块后读取 `int count` 与 `tap status` | 前置初始化会清除 FIFO 路由，配置命令均必须打印 `PASS`；清零后的 `int_count` 必须大于 0。检测成功时 `tap_status` 打印 `number=1` 或 `number=2`、`axis=1/2/3`。由于机械结构影响，事件状态可能需要多次敲击确认，但 INT 计数增长是必须条件。 |
+| TC-33 | 依次执行 `app qmi8658b init`、`app qmi8658b int callback`、`app qmi8658b int pin on`、`app qmi8658b motion config`、`app qmi8658b feature any on`、`app qmi8658b feature no on`、`app qmi8658b feature sig on`、`app qmi8658b int map activity`、`app qmi8658b int clear`；快速晃动一次，等待约 400 ms，再在随后 200 ms 内快速晃动第二次，立即执行 `app qmi8658b int count` 与 `app qmi8658b motion status` | 所有配置命令必须打印 `PASS`，`int_count` 必须大于 0，且 `motion status` 必须打印 `sig=1`。`int_count` 可能由 Any/No/Sig 任一活动事件增加，Sig-Motion 通过判定以 `sig=1` 为准。保持静止约 1.2 秒后，`sig` 应被 No-Motion 清除并恢复为 `0`。 |
 
-`imu_int_map` 当前公开接口仅允许映射到 INT1，不支持传入 `IMU_INT_NONE` 解除映射。测试完成后关闭 INT1 输出并重新初始化模块即可恢复默认路由。
+`activity` 为 Any/No/Sig/Tap 的共享 INT1 路由；功能是否产生中断由对应的 `feature` 开关控制，不能按单一活动类型独立映射。`imu_int_map` 当前公开接口仅允许映射到 INT1，不支持传入 `IMU_INT_NONE` 解除映射。测试完成后关闭 INT1 输出并重新初始化模块即可恢复默认路由。
 
 ## 9. 测试收尾
 
